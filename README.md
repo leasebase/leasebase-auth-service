@@ -13,15 +13,35 @@ Authentication and authorization service. Extends Cognito with app-specific auth
 
 Managed by Terraform in [leasebase-iac](https://github.com/motart/leasebase-iac).
 
+## Auth Flow
+
+1. Frontend sends `POST /api/auth/login` with email + password.
+2. BFF gateway proxies to `POST /internal/auth/login`, which authenticates via Cognito `USER_PASSWORD_AUTH`.
+3. On success, returns `{ accessToken, idToken, refreshToken, expiresIn }`.
+4. Frontend stores the **access token** and sends it as `Authorization: Bearer <accessToken>` on subsequent requests.
+5. Protected routes (e.g. `GET /internal/auth/me`) use `requireAuth` middleware from `@leasebase/service-common`, which verifies the access token (signature, issuer, expiry, `token_use=access`, `client_id`).
+
+### Token Verification (Cognito-specific)
+
+Cognito access tokens do **not** contain an `aud` claim — they use `client_id` instead. The shared JWT verifier in `@leasebase/service-common` handles this:
+- Access tokens → validates `client_id` matches `COGNITO_CLIENT_ID`
+- ID tokens → validates `aud` matches `COGNITO_CLIENT_ID`
+
+## Environment Variables
+
+| Variable | Required | Description |
+|---|---|---|
+| `COGNITO_REGION` | Yes | AWS region (e.g. `us-west-2`) |
+| `COGNITO_USER_POOL_ID` | Yes | Cognito user pool ID |
+| `COGNITO_CLIENT_ID` | Yes | Cognito app client ID (canonical name) |
+
 ## Getting Started
 
 ```bash
 npm install
-npm run start:dev
-docker build -t leasebase-auth-service .
+npm run dev
 npm test
 ```
-
 
 ---
 
