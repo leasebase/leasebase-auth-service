@@ -101,6 +101,6 @@ describe('GET /internal/auth/me', () => {
 
     // No DB user found → fail closed with 401
     expect(status).toBe(401);
-    expect(body.error.message).toContain('User profile not found');
+    expect((body as any).error.message).toContain('User profile not found');
   });
 });

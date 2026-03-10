@@ -136,7 +136,7 @@ router.post('/register', validateBody(registerSchema), async (req: Request, res:
     const { email, password, firstName, lastName, userType } = req.body as z.infer<typeof registerSchema>;
 
     // Double-guard: reject tenant self-registration even if Zod validation is bypassed.
-    if ((userType as string).toUpperCase() === 'TENANT') {
+    if ((userType as unknown as string).toUpperCase() === 'TENANT') {
       throw new ValidationError('Tenants must be invited by a property owner or manager.');
     }
 
@@ -161,7 +161,7 @@ router.post('/register', validateBody(registerSchema), async (req: Request, res:
     // ── 2. Bootstrap Org + User + Subscription for OWNER / PM ────────
     // Tenant org/user records are created when a PM invites the tenant,
     // not during self-registration.
-    if (userType !== 'TENANT' && cognitoSub) {
+    if ((userType as unknown as string) !== 'TENANT' && cognitoSub) {
       try {
         const orgType = mapUserTypeToOrgType(userType);
         const fullName = `${firstName} ${lastName}`.trim();
