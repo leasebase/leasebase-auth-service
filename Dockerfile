@@ -2,9 +2,10 @@ FROM node:20-alpine AS builder
 WORKDIR /app
 
 # Install from local service-common tarball (dev build)
+# Update this tarball by running: npm pack in leasebase-service-common, then copying here.
 COPY package.json ./
 COPY leasebase-service-common-*.tgz ./
-RUN sed -i 's|"@leasebase/service-common": "[^"]*"|"@leasebase/service-common": "file:./leasebase-service-common-1.1.0.tgz"|' package.json && \
+RUN sed -i 's|"@leasebase/service-common": "[^"]*"|"@leasebase/service-common": "file:./leasebase-service-common-1.1.1.tgz"|' package.json && \
     npm install --ignore-scripts
 
 COPY tsconfig.json ./
