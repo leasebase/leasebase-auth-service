@@ -244,6 +244,25 @@ router.post('/register', validateBody(registerSchema), async (req: Request, res:
     });
   } catch (err: any) {
     if (err.name === 'UsernameExistsException') {
+      // Log which store(s) contain the duplicate for operational debugging.
+      // The user-facing message stays generic.
+      const normalized = normalizeEmail(req.body.email);
+      let dbExists = false;
+      try {
+        const dbUser = await queryOne<{ id: string }>(
+          `SELECT "id" FROM "User" WHERE LOWER("email") = $1`,
+          [normalized],
+        );
+        dbExists = !!dbUser;
+      } catch (dbErr) {
+        logger.warn({ err: dbErr, email: normalized }, 'register: failed to check DB for duplicate (Cognito already rejected)');
+      }
+
+      logger.warn(
+        { email: normalized, cognitoDuplicate: true, dbDuplicate: dbExists },
+        `Registration blocked: duplicate user — Cognito=YES, DB=${dbExists ? 'YES' : 'NO'}`,
+      );
+
       return next(new ValidationError('An account with this email already exists'));
     }
     if (err.name === 'InvalidPasswordException') {
