@@ -9,7 +9,12 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import express from 'express';
 import type { Request, Response, NextFunction } from 'express';
 
-// Mock requireAuth from service-common to inject a fake user.
+// Hoisted mocks for DB layer
+const { mockQueryOne } = vi.hoisted(() => ({
+  mockQueryOne: vi.fn(),
+}));
+
+// Mock requireAuth and queryOne from service-common.
 vi.mock('@leasebase/service-common', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@leasebase/service-common')>();
   return {
@@ -26,6 +31,7 @@ vi.mock('@leasebase/service-common', async (importOriginal) => {
       };
       next();
     },
+    queryOne: mockQueryOne,
   };
 });
 
@@ -36,6 +42,11 @@ function buildApp() {
   const app = express();
   app.use(express.json());
   app.use('/internal/auth', authRouter);
+  // Error handler so auth errors return JSON instead of HTML
+  app.use((err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+    const status = err.statusCode || err.status || 500;
+    res.status(status).json({ error: { message: err.message, code: err.code || 'ERROR' } });
+  });
   return app;
 }
 
@@ -56,17 +67,40 @@ async function request(app: ReturnType<typeof express>, method: string, path: st
 }
 
 describe('GET /internal/auth/me', () => {
-  it('returns the authenticated user profile', async () => {
+  beforeEach(() => {
+    mockQueryOne.mockReset();
+  });
+
+  it('returns DB-backed profile when user exists in DB', async () => {
+    // /me looks up user by cognitoSub — return DB user with authoritative role.
+    mockQueryOne.mockResolvedValueOnce({
+      id: 'db-user-id',
+      email: 'alice@example.com',
+      name: 'Alice',
+      role: 'ORG_ADMIN',
+    });
+
     const app = buildApp();
     const { status, body } = await request(app, 'GET', '/internal/auth/me');
 
     expect(status).toBe(200);
     expect(body).toEqual({
-      id: 'user-abc',
+      id: 'db-user-id',
       orgId: 'org-1',
       email: 'alice@example.com',
       name: 'Alice',
       role: 'ORG_ADMIN',
     });
+  });
+
+  it('returns 401 when DB user not found (fail closed)', async () => {
+    mockQueryOne.mockResolvedValueOnce(null);
+
+    const app = buildApp();
+    const { status, body } = await request(app, 'GET', '/internal/auth/me');
+
+    // No DB user found → fail closed with 401
+    expect(status).toBe(401);
+    expect(body.error.message).toContain('User profile not found');
   });
 });

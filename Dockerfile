@@ -1,10 +1,11 @@
 FROM node:20-alpine AS builder
 WORKDIR /app
 
-# GitHub Packages auth for @leasebase/* scoped packages
-ARG NODE_AUTH_TOKEN
-COPY .npmrc package.json package-lock.json ./
-RUN npm ci --ignore-scripts
+# Install from local service-common tarball (dev build)
+COPY package.json ./
+COPY leasebase-service-common-*.tgz ./
+RUN sed -i 's|"@leasebase/service-common": "[^"]*"|"@leasebase/service-common": "file:./leasebase-service-common-1.1.0.tgz"|' package.json && \
+    npm install --ignore-scripts
 
 COPY tsconfig.json ./
 COPY src ./src
