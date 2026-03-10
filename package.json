@@ -11,6 +11,7 @@
     "lint": "tsc --noEmit",
     "dev:inspect-user": "tsx scripts/dev-user.ts inspect",
     "dev:delete-user": "tsx scripts/dev-user.ts delete",
+    "dev:repair-user": "tsx scripts/dev-user.ts repair",
     "dev:list-users": "tsx scripts/dev-user.ts list"
   },
   "dependencies": {

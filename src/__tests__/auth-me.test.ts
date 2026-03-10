@@ -72,9 +72,10 @@ describe('GET /internal/auth/me', () => {
   });
 
   it('returns DB-backed profile when user exists in DB', async () => {
-    // /me looks up user by cognitoSub — return DB user with authoritative role.
+    // /me looks up user by cognitoSub — return DB user with authoritative role + orgId.
     mockQueryOne.mockResolvedValueOnce({
       id: 'db-user-id',
+      organizationId: 'org-from-db',
       email: 'alice@example.com',
       name: 'Alice',
       role: 'ORG_ADMIN',
@@ -86,7 +87,7 @@ describe('GET /internal/auth/me', () => {
     expect(status).toBe(200);
     expect(body).toEqual({
       id: 'db-user-id',
-      orgId: 'org-1',
+      orgId: 'org-from-db',
       email: 'alice@example.com',
       name: 'Alice',
       role: 'ORG_ADMIN',
@@ -102,5 +103,33 @@ describe('GET /internal/auth/me', () => {
     // No DB user found → fail closed with 401
     expect(status).toBe(401);
     expect((body as any).error.message).toContain('User profile not found');
+  });
+
+  it('returns DB-backed role even when JWT-derived role differs', async () => {
+    // The DB role (OWNER) should be returned, not the JWT-derived role (ORG_ADMIN set in mock)
+    mockQueryOne.mockResolvedValueOnce({
+      id: 'db-user-id-2',
+      organizationId: 'org-2',
+      email: 'alice@example.com',
+      name: 'Alice',
+      role: 'OWNER',
+    });
+
+    const app = buildApp();
+    const { status, body } = await request(app, 'GET', '/internal/auth/me');
+
+    expect(status).toBe(200);
+    expect((body as any).role).toBe('OWNER');
+  });
+
+  it('returns 500 when DB query throws (not 401)', async () => {
+    mockQueryOne.mockRejectedValueOnce(new Error('connection refused'));
+
+    const app = buildApp();
+    const { status, body } = await request(app, 'GET', '/internal/auth/me');
+
+    // DB error should surface as 500, not silently return 401
+    expect(status).toBe(500);
+    expect((body as any).error).toBeDefined();
   });
 });

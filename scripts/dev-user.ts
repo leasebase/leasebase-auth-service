@@ -171,6 +171,92 @@ async function dbDeleteUser(email: string): Promise<number> {
 
 // ── Commands ───────────────────────────────────────────────────────────────
 
+/**
+ * Repair a "stuck" user: exists in Cognito but has no DB records.
+ * Creates Organization + User + Subscription using Cognito attributes.
+ */
+async function repair(email: string): Promise<void> {
+  const normalized = normalizeEmail(email);
+  console.log(`\nRepairing stuck user: ${normalized}`);
+  console.log(`  Pool:   ${USER_POOL_ID}`);
+  console.log(`  Region: ${REGION}`);
+  console.log(`  DB:     ${DB_URL ? 'configured' : 'NOT configured (cannot repair)'}\n`);
+
+  if (!DB_URL) {
+    console.error('ERROR: DATABASE_URL is required for repair.');
+    process.exit(1);
+  }
+
+  // 1. Check Cognito
+  const cog = await cognitoGetUser(normalized);
+  if (!cog.exists || !cog.sub) {
+    console.error('  ❌ User not found in Cognito — nothing to repair.');
+    process.exit(1);
+  }
+  console.log(`  ✅ COGNITO: found (sub=${cog.sub}, status=${cog.status})`);
+
+  // 2. Check DB — must NOT already exist
+  const db = await dbLookupUser(normalized);
+  if (db.exists) {
+    console.log('  ✅ DATABASE: user already exists — no repair needed.');
+    for (const row of db.rows) {
+      console.log(`     id=${row.id} role=${row.role} status=${row.status}`);
+    }
+    return;
+  }
+  console.log('  ❌ DATABASE: user NOT found — will create bootstrap records.\n');
+
+  // 3. Determine role from Cognito custom:role or default to OWNER
+  const cognitoRole = cog.attributes?.['custom:role'] || '';
+  const roleMap: Record<string, { role: string; orgType: string }> = {
+    OWNER: { role: 'OWNER', orgType: 'LANDLORD' },
+    ORG_ADMIN: { role: 'ORG_ADMIN', orgType: 'PM_COMPANY' },
+    PROPERTY_MANAGER: { role: 'ORG_ADMIN', orgType: 'PM_COMPANY' },
+  };
+  const mapping = roleMap[cognitoRole.toUpperCase()] || roleMap['OWNER'];
+  const fullName = `${cog.attributes?.['given_name'] ?? ''} ${cog.attributes?.['family_name'] ?? ''}`.trim() || normalized;
+
+  console.log(`  Role:     ${mapping.role} (from Cognito custom:role="${cognitoRole}")`);
+  console.log(`  Org Type: ${mapping.orgType}`);
+  console.log(`  Name:     ${fullName}\n`);
+
+  // 4. Create records in a transaction
+  const pool = new Pool({ connectionString: DB_URL, max: 1 });
+  try {
+    await pool.query('BEGIN');
+
+    const orgResult = await pool.query(
+      `INSERT INTO "Organization" ("id", "type", "name", "plan", "createdAt", "updatedAt")
+       VALUES (gen_random_uuid(), $1::"OrganizationType", $2, 'basic', NOW(), NOW())
+       RETURNING "id"`,
+      [mapping.orgType, `${fullName}'s Organization`],
+    );
+    const orgId = orgResult.rows[0].id;
+
+    await pool.query(
+      `INSERT INTO "User" ("id", "organizationId", "email", "name", "cognitoSub", "role", "status", "createdAt", "updatedAt")
+       VALUES (gen_random_uuid(), $1, $2, $3, $4, $5::"UserRole", 'ACTIVE', NOW(), NOW())`,
+      [orgId, normalized, fullName, cog.sub, mapping.role],
+    );
+
+    await pool.query(
+      `INSERT INTO "Subscription" ("id", "organizationId", "plan", "unitCount", "status", "createdAt", "updatedAt")
+       VALUES (gen_random_uuid(), $1, 'basic', 0, 'ACTIVE'::"SubscriptionStatus", NOW(), NOW())`,
+      [orgId],
+    );
+
+    await pool.query('COMMIT');
+    console.log(`  ✅ Created Organization (${orgId}), User, and Subscription.`);
+    console.log(`  User can now log in successfully.\n`);
+  } catch (err) {
+    await pool.query('ROLLBACK');
+    console.error('  ❌ Failed to create DB records:', err);
+    process.exit(1);
+  } finally {
+    await pool.end();
+  }
+}
+
 async function inspect(email: string): Promise<void> {
   const normalized = normalizeEmail(email);
   console.log(`\nInspecting user: ${normalized}`);
@@ -274,11 +360,20 @@ async function main(): Promise<void> {
       await listUsers();
       break;
 
+    case 'repair':
+      if (!email) {
+        console.error('Usage: dev-user.ts repair <email>');
+        process.exit(1);
+      }
+      await repair(email);
+      break;
+
     default:
-      console.error('Usage: dev-user.ts <inspect|delete|list> [email]');
+      console.error('Usage: dev-user.ts <inspect|delete|repair|list> [email]');
       console.error('\nCommands:');
       console.error('  inspect <email>  — check if user exists in Cognito and/or DB');
       console.error('  delete  <email>  — remove user from Cognito and DB');
+      console.error('  repair  <email>  — create missing DB records for a Cognito-only user');
       console.error('  list             — list all Cognito users in the pool');
       process.exit(1);
   }
