@@ -213,22 +213,22 @@ describe('POST /internal/auth/register — role handling', () => {
     expect(mockCognitoSend).not.toHaveBeenCalled();
   });
 
-  // ── Bootstrap failure resilience ─────────────────────────────────────────
+  // ── Bootstrap failure detection ──────────────────────────────────────────
 
-  it('OWNER signup succeeds even if DB bootstrap fails', async () => {
+  it('OWNER signup fails with 500 when DB bootstrap fails (Cognito user was created)', async () => {
     mockCognitoSend.mockResolvedValueOnce({
       UserConfirmed: false,
       UserSub: 'cognito-sub-owner-fail',
     });
 
-    // Simulate DB failure
-    mockQuery.mockRejectedValueOnce(new Error('DB connection failed'));
+    // Simulate DB failure (e.g., auth_user lacks INSERT permission)
+    mockQuery.mockRejectedValueOnce(new Error('permission denied for table Organization'));
 
     const app = buildApp();
-    const { status, body } = await postRegister(app, { ...basePayload, userType: 'OWNER' });
+    const { status } = await postRegister(app, { ...basePayload, userType: 'OWNER' });
 
-    // Registration should still succeed (Cognito user created)
-    expect(status).toBe(201);
-    expect(body.userSub).toBe('cognito-sub-owner-fail');
+    // Bootstrap failure must surface — a user without DB records cannot function.
+    // The Cognito user exists but is unconfirmed; the user can retry.
+    expect(status).toBe(500);
   });
 });

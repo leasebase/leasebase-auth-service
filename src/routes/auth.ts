@@ -224,14 +224,36 @@ router.post('/register', validateBody(registerSchema), async (req: Request, res:
             'Registration bootstrap: created Organization + User + Subscription',
           );
         }
-      } catch (bootstrapErr) {
-        // Cognito user is created — log the bootstrap failure but do not
-        // fail the registration.  The /me first-login upsert in the
-        // monolith can recover, and the user can still verify email.
+    } catch (bootstrapErr: any) {
+        // Cognito user is created but DB records are missing.
+        // This is NOT recoverable by the user — /me will fail because
+        // there is no User row.  Fail the registration so the frontend
+        // can surface an actionable error.
+        //
+        // The Cognito user is unconfirmed at this point.  A retry with
+        // the same email will hit UsernameExistsException in Cognito,
+        // so manual remediation (backfill script or Cognito delete) is
+        // required before the user can re-register.
         logger.error(
-          { err: bootstrapErr, email, userType },
-          'Registration bootstrap failed — Cognito user created but DB records may be missing',
+          {
+            err: bootstrapErr,
+            email: normalized,
+            userType,
+            cognitoSub,
+            phase: 'register.bootstrap',
+            errorClass: bootstrapErr?.constructor?.name,
+            errorMessage: bootstrapErr?.message,
+          },
+          'Registration bootstrap FAILED — Cognito user created but DB records missing',
         );
+        // Surface a generic 500 — the outer catch will pass it to next(err)
+        const surfaceErr = new Error(
+          'Account creation failed. A Cognito identity was created but the '
+          + 'application database records could not be written. '
+          + 'Please contact support or retry after the stuck Cognito user is removed.',
+        );
+        (surfaceErr as any).statusCode = 500;
+        throw surfaceErr;
       }
     }
 
@@ -244,6 +266,25 @@ router.post('/register', validateBody(registerSchema), async (req: Request, res:
     });
   } catch (err: any) {
     if (err.name === 'UsernameExistsException') {
+      // Log which store(s) contain the duplicate for operational debugging.
+      // The user-facing message stays generic.
+      const normalized = normalizeEmail(req.body.email);
+      let dbExists = false;
+      try {
+        const dbUser = await queryOne<{ id: string }>(
+          `SELECT "id" FROM "User" WHERE LOWER("email") = $1`,
+          [normalized],
+        );
+        dbExists = !!dbUser;
+      } catch (dbErr) {
+        logger.warn({ err: dbErr, email: normalized }, 'register: failed to check DB for duplicate (Cognito already rejected)');
+      }
+
+      logger.warn(
+        { email: normalized, cognitoDuplicate: true, dbDuplicate: dbExists },
+        `Registration blocked: duplicate user — Cognito=YES, DB=${dbExists ? 'YES' : 'NO'}`,
+      );
+
       return next(new ValidationError('An account with this email already exists'));
     }
     if (err.name === 'InvalidPasswordException') {
@@ -384,16 +425,18 @@ router.get('/me', requireAuth, async (req: Request, res: Response, next: NextFun
 
     // In dev-bypass mode the role is set correctly from the header — skip DB.
     if (user.sub !== 'dev-bypass') {
-      // Look up the user's authoritative role from the DB.
-      const dbUser = await queryOne<{ id: string; email: string; name: string; role: string }>(
-        `SELECT "id", "email", "name", "role" FROM "User" WHERE "cognitoSub" = $1`,
+      // Look up the user’s authoritative profile from the DB.
+      // We fetch organizationId here because Cognito access tokens do NOT
+      // carry custom:orgId — the JWT-derived user.orgId is usually empty.
+      const dbUser = await queryOne<{ id: string; organizationId: string; email: string; name: string; role: string }>(
+        `SELECT "id", "organizationId", "email", "name", "role" FROM "User" WHERE "cognitoSub" = $1`,
         [user.sub],
       );
 
       if (dbUser) {
         res.json({
           id: dbUser.id,
-          orgId: user.orgId,
+          orgId: dbUser.organizationId,
           email: dbUser.email,
           name: dbUser.name,
           role: dbUser.role,
@@ -404,8 +447,17 @@ router.get('/me', requireAuth, async (req: Request, res: Response, next: NextFun
       // No DB user and no trustworthy role source — fail closed.
       // The JWT-derived role may be TENANT fallback from requireAuth, which
       // we no longer trust.  Return 401 so the client clears the session.
+      const enrichedRole = req.headers['x-lb-enriched-role'] as string | undefined;
       logger.warn(
-        { sub: user.sub, email: user.email },
+        {
+          sub: user.sub,
+          email: user.email,
+          jwtRole: user.role,
+          enrichedRole: enrichedRole || '(none)',
+          hint: 'Cognito user exists but no DB User row. '
+            + 'Likely cause: registration DB bootstrap failed silently. '
+            + 'Run the backfill script or re-register.',
+        },
         '/me: no DB user found for cognitoSub — failing closed',
       );
       throw new UnauthorizedError('User profile not found. Please contact support.');
