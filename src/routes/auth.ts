@@ -6,6 +6,8 @@ import {
   SignUpCommand,
   ConfirmSignUpCommand,
   ResendConfirmationCodeCommand,
+  ForgotPasswordCommand,
+  ConfirmForgotPasswordCommand,
   AdminCreateUserCommand,
   AdminSetUserPasswordCommand,
   AuthFlowType,
@@ -85,6 +87,27 @@ const resendSchema = z.object({
   email: z.string().email(),
 });
 
+const forgotPasswordSchema = z.object({
+  email: z.string().email(),
+});
+
+const resetPasswordSchema = z.object({
+  email: z.string().email(),
+  code: z.string().min(1),
+  newPassword: z
+    .string()
+    .min(8)
+    .regex(/[A-Z]/, 'Password must contain an uppercase letter')
+    .regex(/[a-z]/, 'Password must contain a lowercase letter')
+    .regex(/\d/, 'Password must contain a number')
+    .regex(/[^A-Za-z0-9]/, 'Password must contain a special character'),
+});
+
+/** Normalize email: lowercase + trim. */
+function normalizeEmail(email: string): string {
+  return email.toLowerCase().trim();
+}
+
 // --- POST /login ---
 router.post('/login', validateBody(loginSchema), async (req: Request, res: Response, next: NextFunction) => {
   try {
@@ -93,12 +116,13 @@ router.post('/login', validateBody(loginSchema), async (req: Request, res: Respo
     }
 
     const { email, password } = req.body;
+    const normalized = normalizeEmail(email);
 
     const command = new InitiateAuthCommand({
       AuthFlow: AuthFlowType.USER_PASSWORD_AUTH,
       ClientId: clientId,
       AuthParameters: {
-        USERNAME: email,
+        USERNAME: normalized,
         PASSWORD: password,
       },
     });
@@ -120,7 +144,11 @@ router.post('/login', validateBody(loginSchema), async (req: Request, res: Respo
       return next(new UnauthorizedError('Invalid email or password'));
     }
     if (err.name === 'UserNotConfirmedException') {
-      return next(new ValidationError('Please verify your email before logging in'));
+      return res.status(403).json({
+        code: 'USER_NOT_CONFIRMED',
+        message: 'Your email address has not been confirmed.',
+        nextStep: 'CONFIRM_SIGN_UP',
+      });
     }
     next(err);
   }
@@ -134,6 +162,7 @@ router.post('/register', validateBody(registerSchema), async (req: Request, res:
     }
 
     const { email, password, firstName, lastName, userType } = req.body as z.infer<typeof registerSchema>;
+    const normalized = normalizeEmail(email);
 
     // Double-guard: reject tenant self-registration even if Zod validation is bypassed.
     if ((userType as unknown as string).toUpperCase() === 'TENANT') {
@@ -145,10 +174,10 @@ router.post('/register', validateBody(registerSchema), async (req: Request, res:
     // ── 1. Create user in Cognito with custom:role attribute ──────────
     const command = new SignUpCommand({
       ClientId: clientId,
-      Username: email,
+      Username: normalized,
       Password: password,
       UserAttributes: [
-        { Name: 'email', Value: email },
+        { Name: 'email', Value: normalized },
         { Name: 'given_name', Value: firstName },
         { Name: 'family_name', Value: lastName },
         { Name: 'custom:role', Value: appRole },
@@ -180,7 +209,7 @@ router.post('/register', validateBody(registerSchema), async (req: Request, res:
           await query(
             `INSERT INTO "User" ("id", "organizationId", "email", "name", "cognitoSub", "role", "status", "createdAt", "updatedAt")
              VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, 'ACTIVE', NOW(), NOW())`,
-            [orgId, email, fullName, cognitoSub, appRole],
+            [orgId, normalized, fullName, cognitoSub, appRole],
           );
 
           // Create subscription (basic plan)
@@ -207,11 +236,11 @@ router.post('/register', validateBody(registerSchema), async (req: Request, res:
     }
 
     res.status(201).json({
+      message: 'Account created. Please check your email for a confirmation code.',
+      nextStep: 'CONFIRM_SIGN_UP',
+      email: normalized,
       userConfirmed: response.UserConfirmed ?? false,
       userSub: cognitoSub,
-      message: response.UserConfirmed
-        ? 'Registration successful. You can now log in.'
-        : 'Registration successful. Please check your email for a verification code.',
     });
   } catch (err: any) {
     if (err.name === 'UsernameExistsException') {
@@ -232,20 +261,24 @@ router.post('/confirm-email', validateBody(confirmEmailSchema), async (req: Requ
     }
 
     const { email, code } = req.body;
+    const normalized = normalizeEmail(email);
 
     await cognitoClient.send(new ConfirmSignUpCommand({
       ClientId: clientId,
-      Username: email,
+      Username: normalized,
       ConfirmationCode: code,
     }));
 
-    res.json({ message: 'Email verified successfully. You can now sign in.' });
+    res.json({ message: 'Your email has been confirmed. You can now sign in.' });
   } catch (err: any) {
     if (err.name === 'CodeMismatchException') {
-      return next(new ValidationError('The verification code is incorrect'));
+      return next(new ValidationError('The confirmation code is incorrect.'));
     }
     if (err.name === 'ExpiredCodeException') {
-      return next(new ValidationError('The verification code has expired'));
+      return next(new ValidationError('The confirmation code has expired.'));
+    }
+    if (err.name === 'TooManyRequestsException') {
+      return next(new ValidationError('Too many attempts. Please wait and try again.'));
     }
     next(err);
   }
@@ -258,15 +291,84 @@ router.post('/resend-confirmation', validateBody(resendSchema), async (req: Requ
       throw new ValidationError('Cognito client ID is not configured');
     }
 
+    const normalized = normalizeEmail(req.body.email);
+
     await cognitoClient.send(new ResendConfirmationCodeCommand({
       ClientId: clientId,
-      Username: req.body.email,
+      Username: normalized,
     }));
 
-    res.json({ message: 'A new verification code has been sent to your email.' });
+    // Always return neutral response — do not reveal whether account exists.
+    res.json({ message: 'If an account exists and is awaiting confirmation, a new code has been sent.' });
   } catch (err: any) {
+    // Swallow UserNotFoundException to prevent account enumeration.
     if (err.name === 'UserNotFoundException') {
-      return next(new ValidationError('No account found for this email'));
+      res.json({ message: 'If an account exists and is awaiting confirmation, a new code has been sent.' });
+      return;
+    }
+    next(err);
+  }
+});
+
+// --- POST /forgot-password ---
+router.post('/forgot-password', validateBody(forgotPasswordSchema), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    if (!clientId) {
+      throw new ValidationError('Cognito client ID is not configured');
+    }
+
+    const normalized = normalizeEmail(req.body.email);
+
+    await cognitoClient.send(new ForgotPasswordCommand({
+      ClientId: clientId,
+      Username: normalized,
+    }));
+
+    // Always return neutral response — do not reveal whether account exists.
+    res.json({ message: 'If an account exists for this email, a reset code has been sent.' });
+  } catch (err: any) {
+    // Swallow UserNotFoundException to prevent account enumeration.
+    if (err.name === 'UserNotFoundException') {
+      res.json({ message: 'If an account exists for this email, a reset code has been sent.' });
+      return;
+    }
+    if (err.name === 'TooManyRequestsException') {
+      return next(new ValidationError('Too many attempts. Please wait and try again.'));
+    }
+    next(err);
+  }
+});
+
+// --- POST /reset-password ---
+router.post('/reset-password', validateBody(resetPasswordSchema), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    if (!clientId) {
+      throw new ValidationError('Cognito client ID is not configured');
+    }
+
+    const { email, code, newPassword } = req.body as z.infer<typeof resetPasswordSchema>;
+    const normalized = normalizeEmail(email);
+
+    await cognitoClient.send(new ConfirmForgotPasswordCommand({
+      ClientId: clientId,
+      Username: normalized,
+      ConfirmationCode: code,
+      Password: newPassword,
+    }));
+
+    res.json({ message: 'Your password has been reset. You can now sign in.' });
+  } catch (err: any) {
+    if (err.name === 'CodeMismatchException') {
+      return next(new ValidationError('The reset code is incorrect.'));
+    }
+    if (err.name === 'ExpiredCodeException') {
+      return next(new ValidationError('The reset code has expired.'));
+    }
+    if (err.name === 'InvalidPasswordException') {
+      return next(new ValidationError('Password does not meet requirements.'));
+    }
+    if (err.name === 'TooManyRequestsException') {
+      return next(new ValidationError('Too many attempts. Please wait and try again.'));
     }
     next(err);
   }
