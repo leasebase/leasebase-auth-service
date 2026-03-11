@@ -43,8 +43,14 @@ const loginSchema = z.object({
   password: z.string().min(1),
 });
 
-/** Allowed signup user types sent by the web registration form. */
-const SIGNUP_USER_TYPES = ['OWNER', 'PROPERTY_MANAGER'] as const;
+/**
+ * Allowed signup user types sent by the web registration form.
+ *
+ * MVP: only OWNER can self-register publicly.
+ * PROPERTY_MANAGER is intentionally excluded to hide the PM persona from public signup.
+ * Re-add 'PROPERTY_MANAGER' here when PM signup is re-enabled.
+ */
+const SIGNUP_USER_TYPES = ['OWNER'] as const;
 type SignupUserType = (typeof SIGNUP_USER_TYPES)[number];
 
 const registerSchema = z.object({
@@ -60,11 +66,15 @@ const registerSchema = z.object({
  *
  *   OWNER            → OWNER       (individual landlord)
  *   PROPERTY_MANAGER → ORG_ADMIN   (admin of a PM company)
+ *
+ * Note: PM branch is kept for future restoration. The `as string` cast
+ * suppresses TS2678 while PROPERTY_MANAGER is excluded from SignupUserType.
  */
 function mapUserTypeToRole(userType: SignupUserType): string {
-  switch (userType) {
+  switch (userType as string) {
     case 'OWNER':            return 'OWNER';
     case 'PROPERTY_MANAGER': return 'ORG_ADMIN';
+    default:                 return 'OWNER';
   }
 }
 
@@ -75,7 +85,7 @@ function mapUserTypeToRole(userType: SignupUserType): string {
  *   PROPERTY_MANAGER → PM_COMPANY
  */
 function mapUserTypeToOrgType(userType: SignupUserType): string {
-  return userType === 'PROPERTY_MANAGER' ? 'PM_COMPANY' : 'LANDLORD';
+  return (userType as string) === 'PROPERTY_MANAGER' ? 'PM_COMPANY' : 'LANDLORD';
 }
 
 const confirmEmailSchema = z.object({

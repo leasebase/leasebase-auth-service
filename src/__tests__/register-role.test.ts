@@ -140,19 +140,9 @@ describe('POST /internal/auth/register — role handling', () => {
     expect(userInsertArgs[1]).toContain('OWNER');
   });
 
-  // ── PROPERTY_MANAGER signup ──────────────────────────────────────────────
+  // ── PROPERTY_MANAGER signup ── Rejected (MVP: PM hidden from public signup) ──
 
-  it('PROPERTY_MANAGER signup: maps to ORG_ADMIN role and PM_COMPANY org', async () => {
-    mockCognitoSend.mockResolvedValueOnce({
-      UserConfirmed: false,
-      UserSub: 'cognito-sub-pm-456',
-    });
-
-    mockQuery
-      .mockResolvedValueOnce([{ id: 'org-pm-1' }])
-      .mockResolvedValueOnce([])
-      .mockResolvedValueOnce([]);
-
+  it('PROPERTY_MANAGER signup: rejected with 400 (MVP — PM self-signup disabled)', async () => {
     const app = buildApp();
     const { status } = await postRegister(app, {
       ...basePayload,
@@ -160,20 +150,9 @@ describe('POST /internal/auth/register — role handling', () => {
       userType: 'PROPERTY_MANAGER',
     });
 
-    expect(status).toBe(201);
-
-    // Cognito custom:role should be ORG_ADMIN
-    const signUpCall = mockCognitoSend.mock.calls[0][0];
-    const roleAttr = signUpCall.input.UserAttributes.find((a: any) => a.Name === 'custom:role');
-    expect(roleAttr.Value).toBe('ORG_ADMIN');
-
-    // Org type should be PM_COMPANY
-    const orgInsertArgs = mockQuery.mock.calls[0];
-    expect(orgInsertArgs[1]).toContain('PM_COMPANY');
-
-    // User role should be ORG_ADMIN
-    const userInsertArgs = mockQuery.mock.calls[1];
-    expect(userInsertArgs[1]).toContain('ORG_ADMIN');
+    // PROPERTY_MANAGER is no longer an accepted userType — Zod validation rejects it.
+    expect(status).toBeGreaterThanOrEqual(400);
+    expect(mockCognitoSend).not.toHaveBeenCalled();
   });
 
   // ── TENANT signup ── Rejected ──────────────────────────────────────────────
