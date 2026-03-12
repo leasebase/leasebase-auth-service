@@ -119,7 +119,27 @@ router.post('/login', validateBody(loginSchema), async (req: Request, res: Respo
 
     const response = await cognitoClient.send(command);
 
+    // Cognito may return a challenge instead of tokens (e.g. when the user
+    // was created via AdminCreateUser or had their password set without the
+    // Permanent flag).  Detect this and return an actionable error.
+    if (response.ChallengeName === 'NEW_PASSWORD_REQUIRED') {
+      logger.warn(
+        { email: normalized, challenge: response.ChallengeName },
+        'Login blocked: user is in FORCE_CHANGE_PASSWORD state',
+      );
+      return res.status(403).json({
+        code: 'NEW_PASSWORD_REQUIRED',
+        message: 'You must reset your password before signing in. Please use "Forgot password?" to set a new one.',
+        nextStep: 'RESET_PASSWORD',
+      });
+    }
+
     if (!response.AuthenticationResult) {
+      // Some other unrecognized challenge
+      logger.error(
+        { email: normalized, challenge: response.ChallengeName },
+        'Login failed: unrecognized Cognito challenge',
+      );
       throw new UnauthorizedError('Authentication failed');
     }
 
@@ -138,6 +158,13 @@ router.post('/login', validateBody(loginSchema), async (req: Request, res: Respo
         code: 'USER_NOT_CONFIRMED',
         message: 'Your email address has not been confirmed.',
         nextStep: 'CONFIRM_SIGN_UP',
+      });
+    }
+    if (err.name === 'PasswordResetRequiredException') {
+      return res.status(403).json({
+        code: 'PASSWORD_RESET_REQUIRED',
+        message: 'A password reset is required. Please use "Forgot password?" to set a new one.',
+        nextStep: 'RESET_PASSWORD',
       });
     }
     next(err);
