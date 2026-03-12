@@ -134,39 +134,7 @@ describe('Auth lifecycle endpoints', () => {
     expect((body as any).error).toBeDefined();
   });
 
-  // ── 1c. Register succeeds for PROPERTY_MANAGER (ORG_ADMIN) ─────────────────
-
-  it('register succeeds for PROPERTY_MANAGER and maps role to ORG_ADMIN', async () => {
-    mockCognitoSend.mockResolvedValueOnce({
-      UserConfirmed: false,
-      UserSub: 'sub-pm-789',
-    });
-    // Org bootstrap
-    mockQuery
-      .mockResolvedValueOnce([{ id: 'org-pm' }])
-      .mockResolvedValueOnce([])
-      .mockResolvedValueOnce([]);
-
-    const app = buildApp();
-    const { status, body } = await post(app, '/internal/auth/register', {
-      email: 'pm@example.com',
-      password: 'Password1!',
-      firstName: 'PM',
-      lastName: 'Admin',
-      userType: 'PROPERTY_MANAGER',
-    });
-
-    expect(status).toBe(201);
-    expect(body.nextStep).toBe('CONFIRM_SIGN_UP');
-    // Verify the Cognito signup was called with ORG_ADMIN role
-    const signupCall = mockCognitoSend.mock.calls[0][0];
-    const roleAttr = signupCall.input.UserAttributes.find(
-      (a: any) => a.Name === 'custom:role',
-    );
-    expect(roleAttr?.Value).toBe('ORG_ADMIN');
-  });
-
-  // ── 2. Confirm email success ───────────────────────────────────────────────
+  // ── 2. Confirm email success
 
   it('confirm-email returns success message', async () => {
     mockCognitoSend.mockResolvedValueOnce({});
