@@ -433,9 +433,9 @@ router.post('/reset-password', validateBody(resetPasswordSchema), async (req: Re
 });
 
 // --- GET /me ---
-// The requireAuth middleware may set role to a default (TENANT) when the JWT
-// custom:role claim is absent. For /me we need the DB-backed role so that
-// existing OWNER users are not incorrectly downgraded to TENANT.
+// requireAuth is fail-closed: rejects if JWT lacks custom:role.
+// After auth, we look up the DB-backed profile for the authoritative role,
+// orgId, and display name (Cognito access tokens lack these claims).
 router.get('/me', requireAuth, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const user = (req as AuthenticatedRequest).user;
