@@ -206,12 +206,11 @@ async function repair(email: string): Promise<void> {
   }
   console.log('  ❌ DATABASE: user NOT found — will create bootstrap records.\n');
 
-  // 3. Determine role from Cognito custom:role or default to OWNER
+  // 3. Determine role from Cognito custom:role — only OWNER and TENANT are valid.
   const cognitoRole = cog.attributes?.['custom:role'] || '';
   const roleMap: Record<string, { role: string; orgType: string }> = {
     OWNER: { role: 'OWNER', orgType: 'LANDLORD' },
-    ORG_ADMIN: { role: 'ORG_ADMIN', orgType: 'PM_COMPANY' },
-    PROPERTY_MANAGER: { role: 'ORG_ADMIN', orgType: 'PM_COMPANY' },
+    TENANT: { role: 'TENANT', orgType: 'LANDLORD' },
   };
   const mapping = roleMap[cognitoRole.toUpperCase()] || roleMap['OWNER'];
   const fullName = `${cog.attributes?.['given_name'] ?? ''} ${cog.attributes?.['family_name'] ?? ''}`.trim() || normalized;
