@@ -43,8 +43,11 @@ const loginSchema = z.object({
   password: z.string().min(1),
 });
 
-/** Allowed signup user types sent by the web registration form. */
-const SIGNUP_USER_TYPES = ['OWNER', 'PROPERTY_MANAGER'] as const;
+/**
+ * Allowed signup user types sent by the web registration form.
+ * Only OWNER can self-register. Tenants are invited.
+ */
+const SIGNUP_USER_TYPES = ['OWNER'] as const;
 type SignupUserType = (typeof SIGNUP_USER_TYPES)[number];
 
 const registerSchema = z.object({
@@ -55,27 +58,14 @@ const registerSchema = z.object({
   userType: z.enum(SIGNUP_USER_TYPES),
 });
 
-/**
- * Map the UI signup userType to the internal application role.
- *
- *   OWNER            → OWNER       (individual landlord)
- *   PROPERTY_MANAGER → ORG_ADMIN   (admin of a PM company)
- */
-function mapUserTypeToRole(userType: SignupUserType): string {
-  switch (userType) {
-    case 'OWNER':            return 'OWNER';
-    case 'PROPERTY_MANAGER': return 'ORG_ADMIN';
-  }
+/** Map the UI signup userType to the internal application role. */
+function mapUserTypeToRole(_userType: SignupUserType): string {
+  return 'OWNER';
 }
 
-/**
- * Map signup userType to the Organization type used in the DB.
- *
- *   OWNER            → LANDLORD
- *   PROPERTY_MANAGER → PM_COMPANY
- */
-function mapUserTypeToOrgType(userType: SignupUserType): string {
-  return userType === 'PROPERTY_MANAGER' ? 'PM_COMPANY' : 'LANDLORD';
+/** Map signup userType to the Organization type used in the DB. */
+function mapUserTypeToOrgType(_userType: SignupUserType): string {
+  return 'LANDLORD';
 }
 
 const confirmEmailSchema = z.object({
@@ -444,16 +434,13 @@ router.get('/me', requireAuth, async (req: Request, res: Response, next: NextFun
         return;
       }
 
-      // No DB user and no trustworthy role source — fail closed.
-      // The JWT-derived role may be TENANT fallback from requireAuth, which
-      // we no longer trust.  Return 401 so the client clears the session.
-      const enrichedRole = req.headers['x-lb-enriched-role'] as string | undefined;
+      // No DB user found — fail closed.
+      // Return 401 so the client clears the session.
       logger.warn(
         {
           sub: user.sub,
           email: user.email,
           jwtRole: user.role,
-          enrichedRole: enrichedRole || '(none)',
           hint: 'Cognito user exists but no DB User row. '
             + 'Likely cause: registration DB bootstrap failed silently. '
             + 'Run the backfill script or re-register.',

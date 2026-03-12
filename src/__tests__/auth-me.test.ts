@@ -25,7 +25,7 @@ vi.mock('@leasebase/service-common', async (importOriginal) => {
         userId: 'user-abc',
         orgId: 'org-1',
         email: 'alice@example.com',
-        role: 'ORG_ADMIN',
+        role: 'OWNER',
         name: 'Alice',
         scopes: ['api/read', 'api/write'],
       };
@@ -78,7 +78,7 @@ describe('GET /internal/auth/me', () => {
       organizationId: 'org-from-db',
       email: 'alice@example.com',
       name: 'Alice',
-      role: 'ORG_ADMIN',
+      role: 'OWNER',
     });
 
     const app = buildApp();
@@ -90,7 +90,7 @@ describe('GET /internal/auth/me', () => {
       orgId: 'org-from-db',
       email: 'alice@example.com',
       name: 'Alice',
-      role: 'ORG_ADMIN',
+      role: 'OWNER',
     });
   });
 
@@ -106,20 +106,20 @@ describe('GET /internal/auth/me', () => {
   });
 
   it('returns DB-backed role even when JWT-derived role differs', async () => {
-    // The DB role (OWNER) should be returned, not the JWT-derived role (ORG_ADMIN set in mock)
+    // The DB role (TENANT) should be returned, not the JWT-derived role (OWNER set in mock)
     mockQueryOne.mockResolvedValueOnce({
       id: 'db-user-id-2',
       organizationId: 'org-2',
       email: 'alice@example.com',
       name: 'Alice',
-      role: 'OWNER',
+      role: 'TENANT',
     });
 
     const app = buildApp();
     const { status, body } = await request(app, 'GET', '/internal/auth/me');
 
     expect(status).toBe(200);
-    expect((body as any).role).toBe('OWNER');
+    expect((body as any).role).toBe('TENANT');
   });
 
   it('returns 500 when DB query throws (not 401)', async () => {
