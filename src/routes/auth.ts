@@ -10,6 +10,7 @@ import {
   ConfirmForgotPasswordCommand,
   AdminCreateUserCommand,
   AdminSetUserPasswordCommand,
+  AdminDeleteUserCommand,
   AuthFlowType,
 } from '@aws-sdk/client-cognito-identity-provider';
 import {
@@ -507,21 +508,26 @@ router.get('/config', (_req: Request, res: Response) => {
 });
 
 // --- POST /create-tenant (internal, service-to-service) ---
-// Creates a Cognito user for an invited tenant with a pre-set permanent password.
+// Creates a Cognito user + canonical public."User" row for an invited tenant.
 // Protected by X-Internal-Service-Key header.
 const createTenantSchema = z.object({
   email: z.string().email(),
   password: z.string().min(8),
   firstName: z.string().min(1),
   lastName: z.string().min(1),
+  organizationId: z.string().uuid(),
 });
 
 /**
  * POST /create-tenant — Internal service-to-service endpoint.
  *
- * Creates a Cognito identity for a tenant and returns the cognitoSub.
- * Does NOT create application DB records — the calling service (tenant-service)
- * is responsible for all application DB writes.
+ * Creates the full tenant identity:
+ *   1. Cognito user (AdminCreateUser + permanent password)
+ *   2. Canonical public."User" row (role='TENANT')
+ *
+ * auth-service is the sole owner of public."User" writes.
+ * The calling service (tenant-service) is responsible for domain records
+ * (TenantProfile, leases, unit status) but NOT identity records.
  */
 router.post('/create-tenant', validateBody(createTenantSchema), async (req: Request, res: Response, next: NextFunction) => {
   try {
@@ -535,8 +541,9 @@ router.post('/create-tenant', validateBody(createTenantSchema), async (req: Requ
       throw new ValidationError('Cognito user pool ID is not configured');
     }
 
-    const { email, password, firstName, lastName } = req.body as z.infer<typeof createTenantSchema>;
+    const { email, password, firstName, lastName, organizationId } = req.body as z.infer<typeof createTenantSchema>;
     const appRole = 'TENANT';
+    const fullName = `${firstName} ${lastName}`.trim();
 
     // 1. Create Cognito user (admin-initiated, suppress welcome email)
     const createCommand = new AdminCreateUserCommand({
@@ -567,9 +574,40 @@ router.post('/create-tenant', validateBody(createTenantSchema), async (req: Requ
       Permanent: true,
     }));
 
-    logger.info({ email, cognitoSub }, 'Tenant Cognito identity created via invitation');
+    // 3. Create canonical public."User" row (auth-service owns all User writes)
+    let userId: string;
+    try {
+      const userRows = await query<{ id: string }>(
+        `INSERT INTO "User" ("id", "organizationId", "email", "name", "cognitoSub", "role", "status", "createdAt", "updatedAt")
+         VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, 'ACTIVE', NOW(), NOW())
+         RETURNING "id"`,
+        [organizationId, email, fullName, cognitoSub, appRole],
+      );
+      userId = userRows[0].id;
+    } catch (dbErr: any) {
+      // Cognito user created but DB write failed — compensate by deleting Cognito user
+      logger.error(
+        { err: dbErr, email, cognitoSub, phase: 'create-tenant.db-insert' },
+        'User row INSERT failed after Cognito creation — deleting Cognito user to compensate',
+      );
+      try {
+        await cognitoClient.send(new AdminDeleteUserCommand({
+          UserPoolId: userPoolId,
+          Username: email,
+        }));
+        logger.info({ email }, 'Compensating Cognito delete succeeded');
+      } catch (cleanupErr) {
+        logger.error(
+          { err: cleanupErr, email, cognitoSub },
+          'CRITICAL: Cognito compensating delete FAILED — orphaned Cognito user remains',
+        );
+      }
+      throw dbErr;
+    }
 
-    res.status(201).json({ cognitoSub });
+    logger.info({ email, cognitoSub, userId }, 'Tenant identity created: Cognito + User row');
+
+    res.status(201).json({ cognitoSub, userId });
   } catch (err: any) {
     if (err.name === 'UsernameExistsException') {
       return next(new ValidationError('An account with this email already exists'));
@@ -577,6 +615,63 @@ router.post('/create-tenant', validateBody(createTenantSchema), async (req: Requ
     if (err.name === 'InvalidPasswordException') {
       return next(new ValidationError('Password does not meet requirements'));
     }
+    next(err);
+  }
+});
+
+// --- POST /delete-tenant (internal, service-to-service) ---
+// Compensating cleanup: deletes Cognito user + User row.
+// Used by tenant-service when downstream provisioning fails after identity creation.
+const deleteTenantSchema = z.object({
+  cognitoSub: z.string().min(1),
+  email: z.string().email(),
+});
+
+/**
+ * POST /delete-tenant — Internal service-to-service endpoint.
+ *
+ * Compensating action for failed invitation acceptance:
+ * deletes the Cognito identity and the canonical public."User" row.
+ */
+router.post('/delete-tenant', validateBody(deleteTenantSchema), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const serviceKey = req.headers['x-internal-service-key'] as string | undefined;
+    if (!INTERNAL_SERVICE_KEY || !serviceKey || serviceKey !== INTERNAL_SERVICE_KEY) {
+      throw new UnauthorizedError('Invalid or missing internal service key');
+    }
+
+    if (!userPoolId) {
+      throw new ValidationError('Cognito user pool ID is not configured');
+    }
+
+    const { cognitoSub, email } = req.body as z.infer<typeof deleteTenantSchema>;
+
+    // 1. Delete Cognito user
+    try {
+      await cognitoClient.send(new AdminDeleteUserCommand({
+        UserPoolId: userPoolId,
+        Username: email,
+      }));
+      logger.info({ email, cognitoSub }, 'Cognito user deleted (compensating cleanup)');
+    } catch (cogErr: any) {
+      if (cogErr.name !== 'UserNotFoundException') {
+        logger.error({ err: cogErr, email }, 'Failed to delete Cognito user during cleanup');
+        throw cogErr;
+      }
+      logger.warn({ email }, 'Cognito user not found during cleanup — already deleted');
+    }
+
+    // 2. Delete User row
+    const deleteResult = await query(
+      `DELETE FROM "User" WHERE "cognitoSub" = $1 RETURNING "id"`,
+      [cognitoSub],
+    );
+
+    const deletedCount = Array.isArray(deleteResult) ? deleteResult.length : 0;
+    logger.info({ cognitoSub, deletedRows: deletedCount }, 'User row deleted (compensating cleanup)');
+
+    res.json({ deleted: true, cognitoSub, userRowsDeleted: deletedCount });
+  } catch (err) {
     next(err);
   }
 });
