@@ -113,11 +113,12 @@ describe('POST /auth/create-tenant — Internal service-to-service', () => {
     password: 'StrongPass1!',
     firstName: 'Jane',
     lastName: 'Doe',
+    organizationId: '11111111-1111-1111-1111-111111111111',
   };
 
   const serviceKeyHeader = { 'x-internal-service-key': 'test-service-key' };
 
-  it('creates Cognito user and returns cognitoSub', async () => {
+  it('creates Cognito user + User row and returns cognitoSub + userId', async () => {
     mockCognitoSend
       // AdminCreateUserCommand
       .mockResolvedValueOnce({
@@ -126,21 +127,48 @@ describe('POST /auth/create-tenant — Internal service-to-service', () => {
       // AdminSetUserPasswordCommand
       .mockResolvedValueOnce({});
 
+    // Mock User row INSERT
+    mockQuery.mockResolvedValueOnce([{ id: 'user-id-123' }]);
+
     const r = await req(port, 'POST', '/auth/create-tenant', validPayload, serviceKeyHeader);
     expect(r.status).toBe(201);
     expect(r.body.cognitoSub).toBe('cognito-sub-abc');
+    expect(r.body.userId).toBe('user-id-123');
   });
 
-  it('does NOT create any database records', async () => {
+  it('creates canonical User row in database', async () => {
     mockCognitoSend
       .mockResolvedValueOnce({
         User: { Attributes: [{ Name: 'sub', Value: 'cognito-sub-abc' }] },
       })
       .mockResolvedValueOnce({});
 
+    mockQuery.mockResolvedValueOnce([{ id: 'user-id-456' }]);
+
     await req(port, 'POST', '/auth/create-tenant', validPayload, serviceKeyHeader);
-    expect(mockQuery).not.toHaveBeenCalled();
-    expect(mockQueryOne).not.toHaveBeenCalled();
+    expect(mockQuery).toHaveBeenCalledTimes(1);
+    const [sql, params] = mockQuery.mock.calls[0];
+    expect(sql).toContain('INSERT INTO "User"');
+    expect(params).toContain(validPayload.organizationId);
+    expect(params).toContain(validPayload.email);
+    expect(params).toContain('cognito-sub-abc');
+  });
+
+  it('compensates Cognito on DB failure', async () => {
+    mockCognitoSend
+      .mockResolvedValueOnce({
+        User: { Attributes: [{ Name: 'sub', Value: 'cognito-sub-abc' }] },
+      })
+      .mockResolvedValueOnce({})
+      // AdminDeleteUserCommand (compensating delete)
+      .mockResolvedValueOnce({});
+
+    mockQuery.mockRejectedValueOnce(new Error('DB error'));
+
+    const r = await req(port, 'POST', '/auth/create-tenant', validPayload, serviceKeyHeader);
+    expect(r.status).toBe(500);
+    // Cognito should have been called 3 times: create, set password, delete
+    expect(mockCognitoSend).toHaveBeenCalledTimes(3);
   });
 
   it('rejects when service key is missing', async () => {
@@ -173,7 +201,7 @@ describe('POST /auth/create-tenant — Internal service-to-service', () => {
     expect(r.status).toBe(400);
   });
 
-  it('validates required fields', async () => {
+  it('validates required fields (missing organizationId)', async () => {
     const r = await req(port, 'POST', '/auth/create-tenant', { email: 'a@b.com' }, serviceKeyHeader);
     expect(r.status).toBeGreaterThanOrEqual(400);
   });
