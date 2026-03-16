@@ -51,12 +51,19 @@ const loginSchema = z.object({
 const SIGNUP_USER_TYPES = ['OWNER'] as const;
 type SignupUserType = (typeof SIGNUP_USER_TYPES)[number];
 
+const legalAcceptanceItemSchema = z.object({
+  slug: z.string().min(1),
+  version: z.string().min(1),
+  hash: z.string().optional(),
+});
+
 const registerSchema = z.object({
   email: z.string().email(),
   password: z.string().min(8),
   firstName: z.string().min(1),
   lastName: z.string().min(1),
   userType: z.enum(SIGNUP_USER_TYPES),
+  legalAcceptance: z.array(legalAcceptanceItemSchema).optional(),
 });
 
 /** Map the UI signup userType to the internal application role. */
@@ -97,6 +104,56 @@ const resetPasswordSchema = z.object({
 /** Normalize email: lowercase + trim. */
 function normalizeEmail(email: string): string {
   return email.toLowerCase().trim();
+}
+
+/**
+ * Extract the real client IP behind AWS ALB / reverse proxies.
+ * Prefers the first (leftmost) IP from X-Forwarded-For, which is the
+ * original client IP appended by each proxy hop.
+ * Falls back to req.ip (which respects Express trust-proxy setting).
+ */
+function getClientIp(req: Request): string | undefined {
+  const xff = req.headers['x-forwarded-for'];
+  if (xff) {
+    const first = (Array.isArray(xff) ? xff[0] : xff).split(',')[0];
+    const trimmed = first.trim();
+    if (trimmed) return trimmed;
+  }
+  return req.ip ?? undefined;
+}
+
+/**
+ * Persist one LegalAcceptance row per document accepted.
+ * Inserts all rows in a single multi-value INSERT for efficiency.
+ */
+async function persistLegalAcceptance(
+  userId: string,
+  items: Array<{ slug: string; version: string; hash?: string }>,
+  source: string,
+  ipAddress: string | undefined,
+  userAgent: string | undefined,
+): Promise<void> {
+  if (!items || items.length === 0) return;
+
+  // Build multi-row INSERT: (id, userId, documentSlug, documentVersion, documentHash, acceptedAt, source, ipAddress, userAgent)
+  const values: any[] = [];
+  const placeholders: string[] = [];
+  let paramIndex = 1;
+
+  for (const item of items) {
+    placeholders.push(
+      `(gen_random_uuid(), $${paramIndex}, $${paramIndex + 1}, $${paramIndex + 2}, $${paramIndex + 3}, NOW(), $${paramIndex + 4}, $${paramIndex + 5}, $${paramIndex + 6})`,
+    );
+    values.push(userId, item.slug, item.version, item.hash ?? null, source, ipAddress ?? null, userAgent ?? null);
+    paramIndex += 7;
+  }
+
+  await query(
+    `INSERT INTO "LegalAcceptance" ("id", "userId", "documentSlug", "documentVersion", "documentHash", "acceptedAt", "source", "ipAddress", "userAgent")
+     VALUES ${placeholders.join(', ')}
+     ON CONFLICT ("userId", "documentSlug", "documentVersion", "source") DO NOTHING`,
+    values,
+  );
 }
 
 // --- POST /login ---
@@ -179,7 +236,7 @@ router.post('/register', validateBody(registerSchema), async (req: Request, res:
       throw new ValidationError('Cognito client ID is not configured');
     }
 
-    const { email, password, firstName, lastName, userType } = req.body as z.infer<typeof registerSchema>;
+    const { email, password, firstName, lastName, userType, legalAcceptance } = req.body as z.infer<typeof registerSchema>;
     const normalized = normalizeEmail(email);
 
     // Double-guard: reject tenant self-registration even if Zod validation is bypassed.
@@ -237,9 +294,26 @@ router.post('/register', validateBody(registerSchema), async (req: Request, res:
             [orgId],
           );
 
+          // Persist legal acceptance rows (one per document)
+          if (legalAcceptance && legalAcceptance.length > 0) {
+            const userId = (await queryOne<{ id: string }>(
+              `SELECT "id" FROM "User" WHERE "cognitoSub" = $1`,
+              [cognitoSub],
+            ))?.id;
+            if (userId) {
+              await persistLegalAcceptance(
+                userId,
+                legalAcceptance,
+                'owner-signup',
+                getClientIp(req),
+                req.headers['user-agent'] as string | undefined,
+              );
+            }
+          }
+
           logger.info(
-            { email, userType, appRole, orgId, cognitoSub },
-            'Registration bootstrap: created Organization + User + Subscription',
+            { email, userType, appRole, orgId, cognitoSub, legalDocsAccepted: legalAcceptance?.length ?? 0 },
+            'Registration bootstrap: created Organization + User + Subscription + LegalAcceptance',
           );
         }
     } catch (bootstrapErr: any) {
@@ -516,6 +590,7 @@ const createTenantSchema = z.object({
   firstName: z.string().min(1),
   lastName: z.string().min(1),
   organizationId: z.string().uuid(),
+  legalAcceptance: z.array(legalAcceptanceItemSchema).optional(),
 });
 
 /**
@@ -541,7 +616,7 @@ router.post('/create-tenant', validateBody(createTenantSchema), async (req: Requ
       throw new ValidationError('Cognito user pool ID is not configured');
     }
 
-    const { email, password, firstName, lastName, organizationId } = req.body as z.infer<typeof createTenantSchema>;
+    const { email, password, firstName, lastName, organizationId, legalAcceptance } = req.body as z.infer<typeof createTenantSchema>;
     const appRole = 'TENANT';
     const fullName = `${firstName} ${lastName}`.trim();
 
@@ -605,7 +680,43 @@ router.post('/create-tenant', validateBody(createTenantSchema), async (req: Requ
       throw dbErr;
     }
 
-    logger.info({ email, cognitoSub, userId }, 'Tenant identity created: Cognito + User row');
+    // 4. Persist legal acceptance rows (one per document) — must succeed or fail the identity creation
+    if (legalAcceptance && legalAcceptance.length > 0) {
+      try {
+        await persistLegalAcceptance(
+          userId,
+          legalAcceptance,
+          'tenant-invite',
+          getClientIp(req),
+          req.headers['user-agent'] as string | undefined,
+        );
+      } catch (legalErr: any) {
+        // Legal acceptance persistence failed — compensate by deleting identity
+        logger.error(
+          { err: legalErr, email, cognitoSub, userId, phase: 'create-tenant.legal-acceptance' },
+          'LegalAcceptance INSERT failed — compensating by deleting Cognito user + User row',
+        );
+        try {
+          await query(`DELETE FROM "User" WHERE "id" = $1`, [userId]);
+          await cognitoClient.send(new AdminDeleteUserCommand({
+            UserPoolId: userPoolId,
+            Username: email,
+          }));
+          logger.info({ email, userId }, 'Compensating cleanup succeeded after legal acceptance failure');
+        } catch (cleanupErr) {
+          logger.error(
+            { err: cleanupErr, email, cognitoSub, userId },
+            'CRITICAL: Compensating cleanup FAILED after legal acceptance failure',
+          );
+        }
+        throw legalErr;
+      }
+    }
+
+    logger.info(
+      { email, cognitoSub, userId, legalDocsAccepted: legalAcceptance?.length ?? 0 },
+      'Tenant identity created: Cognito + User row + LegalAcceptance',
+    );
 
     res.status(201).json({ cognitoSub, userId });
   } catch (err: any) {
