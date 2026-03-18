@@ -1,0 +1,16 @@
+# auth-service runtime-critical DB dependencies
+# Format: schema.table or schema.table.column
+# Used by the advisory schema drift checker during deploys.
+
+# Core identity tables (auth-service owns writes to public."User")
+public.User.id
+public.User.email
+public.User.cognitoSub
+
+# Organization + Subscription (created during owner registration)
+public.Organization.id
+public.Subscription.id
+
+# Multi-org membership (multi-lease tenant support)
+public.user_organizations.user_id
+public.user_organizations.organization_id
