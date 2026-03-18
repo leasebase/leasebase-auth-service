@@ -104,7 +104,7 @@ jobs:
           curl -fsSL \
             -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
             -H "Accept: application/vnd.github.v3.raw" \
-            "https://api.github.com/repos/leasebase/leasebase-iac/contents/scripts/run-service-migrations.sh?ref=feat/deploy-hardening-phase1" \
+            "https://api.github.com/repos/leasebase/leasebase-iac/contents/scripts/run-service-migrations.sh?ref=develop" \
             -o /tmp/run-service-migrations.sh
           chmod +x /tmp/run-service-migrations.sh
           bash /tmp/run-service-migrations.sh
