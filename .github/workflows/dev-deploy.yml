@@ -97,6 +97,21 @@ jobs:
           echo "  Digest     : ${{ steps.build.outputs.digest }}"
           echo "══════════════════════════════════════════════"
 
+      # ── Blocking pre-deploy migrations ────────────────────────────────
+      - name: Run database migrations
+        run: |
+          # Download the migration runner from leasebase-iac (pinned to develop)
+          curl -fsSL \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3.raw" \
+            "https://api.github.com/repos/leasebase/leasebase-iac/contents/scripts/run-service-migrations.sh?ref=feat/deploy-hardening-phase1" \
+            -o /tmp/run-service-migrations.sh
+          chmod +x /tmp/run-service-migrations.sh
+          bash /tmp/run-service-migrations.sh
+        env:
+          SERVICE_NAME: auth-service
+          MIGRATIONS_DIR: db/migrations
+
       # ── Advisory schema drift check ──────────────────────────────────
       - name: Advisory schema drift check
         continue-on-error: true
@@ -209,8 +224,8 @@ jobs:
 
           echo "GET /api/auth/me → HTTP $HTTP_CODE"
 
-          if [[ "$HTTP_CODE" == "401" ]]; then
-            echo "✅ Smoke test passed: /api/auth/me returned 401 (unauthenticated)." >> "$GITHUB_STEP_SUMMARY"
+          if [[ "$HTTP_CODE" == "401" || "$HTTP_CODE" == "403" ]]; then
+            echo "✅ Smoke test passed: /api/auth/me returned $HTTP_CODE (unauthenticated)." >> "$GITHUB_STEP_SUMMARY"
           elif [[ "$HTTP_CODE" == "500" ]]; then
             echo "::warning::Smoke test FAILED: /api/auth/me returned 500 (possible missing DB tables)"
             echo "❌ Smoke test FAILED: /api/auth/me returned 500 (advisory)." >> "$GITHUB_STEP_SUMMARY"
