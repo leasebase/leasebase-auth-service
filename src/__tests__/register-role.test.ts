@@ -18,6 +18,7 @@ const { mockCognitoSend, mockQuery, mockQueryOne } = vi.hoisted(() => {
   // Set env vars BEFORE modules are loaded (hoisted block runs first)
   process.env.COGNITO_CLIENT_ID = 'test-client-id';
   process.env.COGNITO_REGION = 'us-west-2';
+  process.env.COGNITO_USER_POOL_ID = 'us-west-2_TestPool';
   return {
     mockCognitoSend: vi.fn(),
     mockQuery: vi.fn(),
@@ -35,6 +36,11 @@ vi.mock('@aws-sdk/client-cognito-identity-provider', () => {
     SignUpCommand: vi.fn().mockImplementation((input: any) => ({ input })),
     ConfirmSignUpCommand: vi.fn(),
     ResendConfirmationCodeCommand: vi.fn(),
+    ForgotPasswordCommand: vi.fn(),
+    ConfirmForgotPasswordCommand: vi.fn(),
+    AdminCreateUserCommand: vi.fn(),
+    AdminSetUserPasswordCommand: vi.fn(),
+    AdminDeleteUserCommand: vi.fn().mockImplementation((input: any) => ({ input })),
     AuthFlowType: { USER_PASSWORD_AUTH: 'USER_PASSWORD_AUTH' },
   };
 });
@@ -106,11 +112,11 @@ describe('POST /internal/auth/register — role handling', () => {
       UserSub: cognitoSub,
     });
 
-    // Org creation returns org ID
+    // Org creation returns org ID; User and Subscription now use RETURNING "id"
     mockQuery
-      .mockResolvedValueOnce([{ id: 'org-owner-1' }])  // INSERT Organization
-      .mockResolvedValueOnce([])                         // INSERT User
-      .mockResolvedValueOnce([]);                        // INSERT Subscription
+      .mockResolvedValueOnce([{ id: 'org-owner-1' }])   // INSERT Organization RETURNING id
+      .mockResolvedValueOnce([{ id: 'user-owner-1' }])  // INSERT User RETURNING id
+      .mockResolvedValueOnce([{ id: 'sub-owner-1' }]);  // INSERT Subscription RETURNING id
 
     const app = buildApp();
     const { status, body } = await postRegister(app, { ...basePayload, userType: 'OWNER' });
@@ -194,20 +200,25 @@ describe('POST /internal/auth/register — role handling', () => {
 
   // ── Bootstrap failure detection ──────────────────────────────────────────
 
-  it('OWNER signup fails with 500 when DB bootstrap fails (Cognito user was created)', async () => {
-    mockCognitoSend.mockResolvedValueOnce({
-      UserConfirmed: false,
-      UserSub: 'cognito-sub-owner-fail',
-    });
+  it('OWNER signup fails with 500 and BOOTSTRAP_FAILED code when DB bootstrap fails', async () => {
+    mockCognitoSend
+      .mockResolvedValueOnce({                    // SignUpCommand succeeds
+        UserConfirmed: false,
+        UserSub: 'cognito-sub-owner-fail',
+      })
+      .mockResolvedValueOnce({});                 // AdminDeleteUserCommand cleanup
 
     // Simulate DB failure (e.g., auth_user lacks INSERT permission)
     mockQuery.mockRejectedValueOnce(new Error('permission denied for table Organization'));
 
     const app = buildApp();
-    const { status } = await postRegister(app, { ...basePayload, userType: 'OWNER' });
+    const { status, body } = await postRegister(app, { ...basePayload, userType: 'OWNER' });
 
-    // Bootstrap failure must surface — a user without DB records cannot function.
-    // The Cognito user exists but is unconfirmed; the user can retry.
+    // Bootstrap failure must surface with BOOTSTRAP_FAILED code
     expect(status).toBe(500);
+    expect(body.code).toBe('BOOTSTRAP_FAILED');
+
+    // Compensating Cognito cleanup should have been called
+    expect(mockCognitoSend).toHaveBeenCalledTimes(2);
   });
 });
