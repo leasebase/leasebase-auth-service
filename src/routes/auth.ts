@@ -610,12 +610,19 @@ router.get('/me', requireAuth, async (req: Request, res: Response, next: NextFun
       );
 
       if (dbUser) {
+        // Fetch all org memberships for multi-lease context switching
+        const orgRows = await query<{ organization_id: string; role: string }>(
+          `SELECT organization_id, role FROM public.user_organizations WHERE user_id = $1`,
+          [dbUser.id],
+        );
+
         res.json({
           id: dbUser.id,
           orgId: dbUser.organizationId,
           email: dbUser.email,
           name: dbUser.name,
           role: dbUser.role,
+          organizations: orgRows.map((r) => ({ orgId: r.organization_id, role: r.role })),
         });
         return;
       }
@@ -678,11 +685,19 @@ const createTenantSchema = z.object({
 });
 
 /**
+/**
  * POST /create-tenant — Internal service-to-service endpoint.
  *
  * Creates the full tenant identity:
- *   1. Cognito user (AdminCreateUser + permanent password)
+ *   1. Cognito user (admin-created, permanent password)
  *   2. Canonical public."User" row (role='TENANT')
+ *   3. user_organizations membership row
+ *
+ * **Multi-lease support**: If a User with this email already exists
+ * (e.g. invited to a different org), we REUSE the existing Cognito
+ * user + User row and only add a `user_organizations` entry for the
+ * new org. The caller receives `existingUser: true` so it knows
+ * the password field was ignored.
  *
  * auth-service is the sole owner of public."User" writes.
  * The calling service (tenant-service) is responsible for domain records
@@ -703,6 +718,35 @@ router.post('/create-tenant', validateBody(createTenantSchema), async (req: Requ
     const { email, password, firstName, lastName, organizationId, legalAcceptance } = req.body as z.infer<typeof createTenantSchema>;
     const appRole = 'TENANT';
     const fullName = `${firstName} ${lastName}`.trim();
+
+    // ── Multi-lease check: does a User with this email already exist? ────
+    const existingUser = await queryOne<{ id: string; cognitoSub: string }>(
+      `SELECT "id", "cognitoSub" FROM "User" WHERE LOWER("email") = LOWER($1)`,
+      [email],
+    );
+
+    if (existingUser) {
+      // Reuse the existing identity — just ensure the org membership exists.
+      await query(
+        `INSERT INTO public.user_organizations (user_id, organization_id, role, created_at)
+         VALUES ($1, $2, $3, NOW())
+         ON CONFLICT (user_id, organization_id) DO NOTHING`,
+        [existingUser.id, organizationId, appRole],
+      );
+
+      logger.info(
+        { email, userId: existingUser.id, cognitoSub: existingUser.cognitoSub, organizationId },
+        'Existing user linked to new org via user_organizations (multi-lease)',
+      );
+
+      return res.status(200).json({
+        cognitoSub: existingUser.cognitoSub,
+        userId: existingUser.id,
+        existingUser: true,
+      });
+    }
+
+    // ── New user: create Cognito identity + User row ─────────────────────
 
     // 1. Create Cognito user (admin-initiated, suppress welcome email)
     const createCommand = new AdminCreateUserCommand({
@@ -764,7 +808,15 @@ router.post('/create-tenant', validateBody(createTenantSchema), async (req: Requ
       throw dbErr;
     }
 
-    // 4. Persist legal acceptance rows (one per document) — must succeed or fail the identity creation
+    // 4. Add user_organizations membership row for the new org
+    await query(
+      `INSERT INTO public.user_organizations (user_id, organization_id, role, created_at)
+       VALUES ($1, $2, $3, NOW())
+       ON CONFLICT (user_id, organization_id) DO NOTHING`,
+      [userId, organizationId, appRole],
+    );
+
+    // 5. Persist legal acceptance rows (one per document) — must succeed or fail the identity creation
     if (legalAcceptance && legalAcceptance.length > 0) {
       try {
         await persistLegalAcceptance(
@@ -799,10 +851,10 @@ router.post('/create-tenant', validateBody(createTenantSchema), async (req: Requ
 
     logger.info(
       { email, cognitoSub, userId, legalDocsAccepted: legalAcceptance?.length ?? 0 },
-      'Tenant identity created: Cognito + User row + LegalAcceptance',
+      'Tenant identity created: Cognito + User row + user_organizations + LegalAcceptance',
     );
 
-    res.status(201).json({ cognitoSub, userId });
+    res.status(201).json({ cognitoSub, userId, existingUser: false });
   } catch (err: any) {
     if (err.name === 'UsernameExistsException') {
       return next(new ValidationError('An account with this email already exists'));
@@ -813,7 +865,6 @@ router.post('/create-tenant', validateBody(createTenantSchema), async (req: Requ
     next(err);
   }
 });
-
 // --- POST /delete-tenant (internal, service-to-service) ---
 // Compensating cleanup: deletes Cognito user + User row.
 // Used by tenant-service when downstream provisioning fails after identity creation.

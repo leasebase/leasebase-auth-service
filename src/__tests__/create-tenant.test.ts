@@ -119,6 +119,9 @@ describe('POST /auth/create-tenant — Internal service-to-service', () => {
   const serviceKeyHeader = { 'x-internal-service-key': 'test-service-key' };
 
   it('creates Cognito user + User row and returns cognitoSub + userId', async () => {
+    // Mock existing user check (none found)
+    mockQueryOne.mockResolvedValueOnce(null);
+
     mockCognitoSend
       // AdminCreateUserCommand
       .mockResolvedValueOnce({
@@ -127,26 +130,36 @@ describe('POST /auth/create-tenant — Internal service-to-service', () => {
       // AdminSetUserPasswordCommand
       .mockResolvedValueOnce({});
 
-    // Mock User row INSERT
-    mockQuery.mockResolvedValueOnce([{ id: 'user-id-123' }]);
+    // Mock User row INSERT + user_organizations INSERT
+    mockQuery
+      .mockResolvedValueOnce([{ id: 'user-id-123' }])  // User INSERT
+      .mockResolvedValueOnce([]);                        // user_organizations INSERT
 
     const r = await req(port, 'POST', '/auth/create-tenant', validPayload, serviceKeyHeader);
     expect(r.status).toBe(201);
     expect(r.body.cognitoSub).toBe('cognito-sub-abc');
     expect(r.body.userId).toBe('user-id-123');
+    expect(r.body.existingUser).toBe(false);
   });
 
   it('creates canonical User row in database', async () => {
+    // Mock existing user check (none found)
+    mockQueryOne.mockResolvedValueOnce(null);
+
     mockCognitoSend
       .mockResolvedValueOnce({
         User: { Attributes: [{ Name: 'sub', Value: 'cognito-sub-abc' }] },
       })
       .mockResolvedValueOnce({});
 
-    mockQuery.mockResolvedValueOnce([{ id: 'user-id-456' }]);
+    // Mock User row INSERT + user_organizations INSERT
+    mockQuery
+      .mockResolvedValueOnce([{ id: 'user-id-456' }])
+      .mockResolvedValueOnce([]);
 
     await req(port, 'POST', '/auth/create-tenant', validPayload, serviceKeyHeader);
-    expect(mockQuery).toHaveBeenCalledTimes(1);
+    // mockQuery called twice: User INSERT + user_organizations INSERT
+    expect(mockQuery).toHaveBeenCalledTimes(2);
     const [sql, params] = mockQuery.mock.calls[0];
     expect(sql).toContain('INSERT INTO "User"');
     expect(params).toContain(validPayload.organizationId);
@@ -155,6 +168,9 @@ describe('POST /auth/create-tenant — Internal service-to-service', () => {
   });
 
   it('compensates Cognito on DB failure', async () => {
+    // Mock existing user check (none found)
+    mockQueryOne.mockResolvedValueOnce(null);
+
     mockCognitoSend
       .mockResolvedValueOnce({
         User: { Attributes: [{ Name: 'sub', Value: 'cognito-sub-abc' }] },
@@ -183,7 +199,24 @@ describe('POST /auth/create-tenant — Internal service-to-service', () => {
     expect(r.status).toBe(401);
   });
 
+  it('reuses existing user identity for multi-lease', async () => {
+    // Mock existing user check (found)
+    mockQueryOne.mockResolvedValueOnce({ id: 'existing-user-id', cognitoSub: 'existing-cognito-sub' });
+    // Mock user_organizations INSERT (ON CONFLICT DO NOTHING)
+    mockQuery.mockResolvedValueOnce([]);
+
+    const r = await req(port, 'POST', '/auth/create-tenant', validPayload, serviceKeyHeader);
+    expect(r.status).toBe(200);
+    expect(r.body.cognitoSub).toBe('existing-cognito-sub');
+    expect(r.body.userId).toBe('existing-user-id');
+    expect(r.body.existingUser).toBe(true);
+    // Cognito should NOT have been called (no new user creation)
+    expect(mockCognitoSend).not.toHaveBeenCalled();
+  });
+
   it('returns 400 for existing username', async () => {
+    // Mock existing user check (none found — new user path)
+    mockQueryOne.mockResolvedValueOnce(null);
     const err = new Error('Username exists') as any;
     err.name = 'UsernameExistsException';
     mockCognitoSend.mockRejectedValueOnce(err);
@@ -193,6 +226,8 @@ describe('POST /auth/create-tenant — Internal service-to-service', () => {
   });
 
   it('returns 400 for invalid password', async () => {
+    // Mock existing user check (none found — new user path)
+    mockQueryOne.mockResolvedValueOnce(null);
     const err = new Error('Invalid password') as any;
     err.name = 'InvalidPasswordException';
     mockCognitoSend.mockRejectedValueOnce(err);
