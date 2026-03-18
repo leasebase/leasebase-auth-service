@@ -10,8 +10,9 @@ import express from 'express';
 import type { Request, Response, NextFunction } from 'express';
 
 // Hoisted mocks for DB layer
-const { mockQueryOne } = vi.hoisted(() => ({
+const { mockQueryOne, mockQuery } = vi.hoisted(() => ({
   mockQueryOne: vi.fn(),
+  mockQuery: vi.fn(),
 }));
 
 // Mock requireAuth and queryOne from service-common.
@@ -32,6 +33,7 @@ vi.mock('@leasebase/service-common', async (importOriginal) => {
       next();
     },
     queryOne: mockQueryOne,
+    query: mockQuery,
   };
 });
 
@@ -69,6 +71,7 @@ async function request(app: ReturnType<typeof express>, method: string, path: st
 describe('GET /internal/auth/me', () => {
   beforeEach(() => {
     mockQueryOne.mockReset();
+    mockQuery.mockReset();
   });
 
   it('returns DB-backed profile when user exists in DB', async () => {
@@ -80,6 +83,8 @@ describe('GET /internal/auth/me', () => {
       name: 'Alice',
       role: 'OWNER',
     });
+    // /me now also queries user_organizations for the organizations array
+    mockQuery.mockResolvedValueOnce([{ organization_id: 'org-from-db', role: 'OWNER' }]);
 
     const app = buildApp();
     const { status, body } = await request(app, 'GET', '/internal/auth/me');
@@ -91,6 +96,7 @@ describe('GET /internal/auth/me', () => {
       email: 'alice@example.com',
       name: 'Alice',
       role: 'OWNER',
+      organizations: [{ orgId: 'org-from-db', role: 'OWNER' }],
     });
   });
 
@@ -114,6 +120,8 @@ describe('GET /internal/auth/me', () => {
       name: 'Alice',
       role: 'TENANT',
     });
+    // user_organizations query
+    mockQuery.mockResolvedValueOnce([{ organization_id: 'org-2', role: 'TENANT' }]);
 
     const app = buildApp();
     const { status, body } = await request(app, 'GET', '/internal/auth/me');
