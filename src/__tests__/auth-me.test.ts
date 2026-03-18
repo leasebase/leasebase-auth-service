@@ -130,6 +130,30 @@ describe('GET /internal/auth/me', () => {
     expect((body as any).role).toBe('TENANT');
   });
 
+  it('returns 200 with empty organizations when user_organizations query fails', async () => {
+    mockQueryOne.mockResolvedValueOnce({
+      id: 'db-user-id-3',
+      organizationId: 'org-3',
+      email: 'alice@example.com',
+      name: 'Alice',
+      role: 'OWNER',
+    });
+    mockQuery.mockRejectedValueOnce(new Error('relation "public.user_organizations" does not exist'));
+
+    const app = buildApp();
+    const { status, body } = await request(app, 'GET', '/internal/auth/me');
+
+    expect(status).toBe(200);
+    expect(body).toEqual({
+      id: 'db-user-id-3',
+      orgId: 'org-3',
+      email: 'alice@example.com',
+      name: 'Alice',
+      role: 'OWNER',
+      organizations: [],
+    });
+  });
+
   it('returns 500 when DB query throws (not 401)', async () => {
     mockQueryOne.mockRejectedValueOnce(new Error('connection refused'));
 

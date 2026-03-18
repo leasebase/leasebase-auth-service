@@ -610,11 +610,22 @@ router.get('/me', requireAuth, async (req: Request, res: Response, next: NextFun
       );
 
       if (dbUser) {
-        // Fetch all org memberships for multi-lease context switching
-        const orgRows = await query<{ organization_id: string; role: string }>(
-          `SELECT organization_id, role FROM public.user_organizations WHERE user_id = $1`,
-          [dbUser.id],
-        );
+        // Fetch all org memberships for multi-lease context switching.
+        // Fail-open: if user_organizations is unavailable (e.g. migration
+        // drift), still return /me with an empty organizations array.
+        let organizations: Array<{ orgId: string; role: string }> = [];
+        try {
+          const orgRows = await query<{ organization_id: string; role: string }>(
+            `SELECT organization_id, role FROM public.user_organizations WHERE user_id = $1`,
+            [dbUser.id],
+          );
+          organizations = orgRows.map((r) => ({ orgId: r.organization_id, role: r.role }));
+        } catch (orgErr) {
+          logger.warn(
+            { err: orgErr, userId: dbUser.id },
+            '/me: user_organizations query failed — returning empty organizations',
+          );
+        }
 
         res.json({
           id: dbUser.id,
@@ -622,7 +633,7 @@ router.get('/me', requireAuth, async (req: Request, res: Response, next: NextFun
           email: dbUser.email,
           name: dbUser.name,
           role: dbUser.role,
-          organizations: orgRows.map((r) => ({ orgId: r.organization_id, role: r.role })),
+          organizations,
         });
         return;
       }
