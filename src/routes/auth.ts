@@ -38,6 +38,10 @@ const cognitoClient = new CognitoIdentityProviderClient({ region });
 // Shared secret for internal service-to-service calls
 const INTERNAL_SERVICE_KEY = process.env.INTERNAL_SERVICE_KEY || '';
 
+// DEV-only emergency flag: if true, legal acceptance persistence failure
+// does NOT abort registration. Default OFF — legal acceptance is required.
+const ALLOW_LEGAL_SOFT_FAIL = process.env.ALLOW_LEGAL_ACCEPTANCE_SOFT_FAIL === 'true';
+
 // --- Schemas ---
 const loginSchema = z.object({
   email: z.string().email(),
@@ -266,6 +270,11 @@ router.post('/register', validateBody(registerSchema), async (req: Request, res:
     // Tenant org/user records are created when a PM invites the tenant,
     // not during self-registration.
     if ((userType as unknown as string) !== 'TENANT' && cognitoSub) {
+      // Track IDs created in this attempt for targeted cleanup on failure.
+      let createdOrgId: string | undefined;
+      let createdUserId: string | undefined;
+      let createdSubscriptionId: string | undefined;
+
       try {
         const orgType = mapUserTypeToOrgType(userType);
         const fullName = `${firstName} ${lastName}`.trim();
@@ -277,74 +286,138 @@ router.post('/register', validateBody(registerSchema), async (req: Request, res:
            RETURNING "id"`,
           [orgType, `${fullName}'s Organization`],
         );
-        const orgId = orgRows[0]?.id;
+        createdOrgId = orgRows[0]?.id;
 
-        if (orgId) {
+        if (createdOrgId) {
           // Create user with correct role and cognitoSub
-          await query(
+          const userRows = await query<{ id: string }>(
             `INSERT INTO "User" ("id", "organizationId", "email", "name", "cognitoSub", "role", "status", "createdAt", "updatedAt")
-             VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, 'ACTIVE', NOW(), NOW())`,
-            [orgId, normalized, fullName, cognitoSub, appRole],
+             VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, 'ACTIVE', NOW(), NOW())
+             RETURNING "id"`,
+            [createdOrgId, normalized, fullName, cognitoSub, appRole],
           );
+          createdUserId = userRows[0]?.id;
 
           // Create subscription (basic plan)
-          await query(
+          const subRows = await query<{ id: string }>(
             `INSERT INTO "Subscription" ("id", "organizationId", "plan", "unitCount", "status", "createdAt", "updatedAt")
-             VALUES (gen_random_uuid(), $1, 'basic', 0, 'ACTIVE', NOW(), NOW())`,
-            [orgId],
+             VALUES (gen_random_uuid(), $1, 'basic', 0, 'ACTIVE', NOW(), NOW())
+             RETURNING "id"`,
+            [createdOrgId],
           );
+          createdSubscriptionId = subRows[0]?.id;
 
           // Persist legal acceptance rows (one per document)
-          if (legalAcceptance && legalAcceptance.length > 0) {
-            const userId = (await queryOne<{ id: string }>(
-              `SELECT "id" FROM "User" WHERE "cognitoSub" = $1`,
-              [cognitoSub],
-            ))?.id;
-            if (userId) {
+          if (legalAcceptance && legalAcceptance.length > 0 && createdUserId) {
+            try {
               await persistLegalAcceptance(
-                userId,
+                createdUserId,
                 legalAcceptance,
                 'owner-signup',
                 getClientIp(req),
                 req.headers['user-agent'] as string | undefined,
               );
+            } catch (legalErr: any) {
+              // Legal acceptance INSERT failed (e.g. table missing, constraint error).
+              if (ALLOW_LEGAL_SOFT_FAIL) {
+                // Guarded DEV-only fallback: log warning but allow registration to proceed.
+                logger.warn(
+                  {
+                    err: legalErr,
+                    email: normalized,
+                    cognitoSub,
+                    userId: createdUserId,
+                    phase: 'register.legal-acceptance',
+                    softFail: true,
+                    errorMessage: legalErr?.message,
+                  },
+                  'LegalAcceptance persistence failed (soft-fail enabled) — registration will proceed without legal acceptance records',
+                );
+              } else {
+                // Default: legal acceptance is required — rethrow to trigger full cleanup.
+                throw legalErr;
+              }
             }
           }
 
           logger.info(
-            { email, userType, appRole, orgId, cognitoSub, legalDocsAccepted: legalAcceptance?.length ?? 0 },
+            { email, userType, appRole, orgId: createdOrgId, cognitoSub, legalDocsAccepted: legalAcceptance?.length ?? 0 },
             'Registration bootstrap: created Organization + User + Subscription + LegalAcceptance',
           );
         }
-    } catch (bootstrapErr: any) {
-        // Cognito user is created but DB records are missing.
-        // This is NOT recoverable by the user — /me will fail because
-        // there is no User row.  Fail the registration so the frontend
-        // can surface an actionable error.
-        //
-        // The Cognito user is unconfirmed at this point.  A retry with
-        // the same email will hit UsernameExistsException in Cognito,
-        // so manual remediation (backfill script or Cognito delete) is
-        // required before the user can re-register.
+      } catch (bootstrapErr: any) {
+        // ── Compensating cleanup: undo Cognito + partial DB records ────
+        // Without cleanup, the orphaned Cognito user blocks re-registration
+        // and partial DB records leave the system in an inconsistent state.
         logger.error(
           {
             err: bootstrapErr,
             email: normalized,
             userType,
             cognitoSub,
+            createdOrgId,
+            createdUserId,
+            createdSubscriptionId,
             phase: 'register.bootstrap',
             errorClass: bootstrapErr?.constructor?.name,
             errorMessage: bootstrapErr?.message,
           },
-          'Registration bootstrap FAILED — Cognito user created but DB records missing',
+          'Registration bootstrap FAILED — starting compensating cleanup',
         );
-        // Surface a generic 500 — the outer catch will pass it to next(err)
+
+        // 1. Delete partial DB records (reverse order of creation)
+        try {
+          if (createdSubscriptionId) {
+            await query(`DELETE FROM "Subscription" WHERE "id" = $1`, [createdSubscriptionId]);
+          }
+          if (createdUserId) {
+            await query(`DELETE FROM "User" WHERE "id" = $1`, [createdUserId]);
+          }
+          if (createdOrgId) {
+            await query(`DELETE FROM "Organization" WHERE "id" = $1`, [createdOrgId]);
+          }
+          logger.info(
+            { email: normalized, cognitoSub, createdOrgId, createdUserId, createdSubscriptionId },
+            'Compensating DB cleanup succeeded — partial records removed',
+          );
+        } catch (dbCleanupErr) {
+          logger.error(
+            { err: dbCleanupErr, email: normalized, cognitoSub, createdOrgId, createdUserId, createdSubscriptionId },
+            'CRITICAL: Compensating DB cleanup FAILED — orphaned DB records may remain',
+          );
+        }
+
+        // 2. Delete the orphaned Cognito user so the email can be re-registered
+        if (userPoolId) {
+          try {
+            await cognitoClient.send(new AdminDeleteUserCommand({
+              UserPoolId: userPoolId,
+              Username: normalized,
+            }));
+            logger.info({ email: normalized, cognitoSub }, 'Compensating Cognito delete succeeded — user can re-register');
+          } catch (cognitoCleanupErr: any) {
+            if (cognitoCleanupErr.name === 'UserNotFoundException') {
+              logger.warn({ email: normalized }, 'Cognito user already absent during cleanup');
+            } else {
+              logger.error(
+                { err: cognitoCleanupErr, email: normalized, cognitoSub },
+                'CRITICAL: Compensating Cognito delete FAILED — orphaned Cognito user remains, manual remediation required',
+              );
+            }
+          }
+        } else {
+          logger.error(
+            { email: normalized, cognitoSub },
+            'Cannot clean up Cognito user — COGNITO_USER_POOL_ID is not configured',
+          );
+        }
+
+        // Surface a structured error for the frontend
         const surfaceErr = new Error(
-          'Account creation failed. A Cognito identity was created but the '
-          + 'application database records could not be written. '
-          + 'Please contact support or retry after the stuck Cognito user is removed.',
+          'Account creation failed. Please try again.',
         );
         (surfaceErr as any).statusCode = 500;
+        (surfaceErr as any).code = 'BOOTSTRAP_FAILED';
         throw surfaceErr;
       }
     }
@@ -359,7 +432,6 @@ router.post('/register', validateBody(registerSchema), async (req: Request, res:
   } catch (err: any) {
     if (err.name === 'UsernameExistsException') {
       // Log which store(s) contain the duplicate for operational debugging.
-      // The user-facing message stays generic.
       const normalized = normalizeEmail(req.body.email);
       let dbExists = false;
       try {
@@ -377,10 +449,22 @@ router.post('/register', validateBody(registerSchema), async (req: Request, res:
         `Registration blocked: duplicate user — Cognito=YES, DB=${dbExists ? 'YES' : 'NO'}`,
       );
 
-      return next(new ValidationError('An account with this email already exists'));
+      return res.status(400).json({
+        code: 'DUPLICATE_EMAIL',
+        error: { message: 'An account with this email already exists', code: 'DUPLICATE_EMAIL' },
+        message: 'An account with this email already exists',
+      });
     }
     if (err.name === 'InvalidPasswordException') {
       return next(new ValidationError('Password does not meet requirements'));
+    }
+    // Bootstrap failures carry a structured code for the frontend.
+    if (err.code === 'BOOTSTRAP_FAILED') {
+      return res.status(500).json({
+        code: 'BOOTSTRAP_FAILED',
+        error: { message: err.message, code: 'BOOTSTRAP_FAILED' },
+        message: err.message,
+      });
     }
     next(err);
   }

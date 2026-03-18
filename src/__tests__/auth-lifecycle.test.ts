@@ -12,6 +12,7 @@ import type { Request, Response, NextFunction } from 'express';
 const { mockCognitoSend, mockQuery, mockQueryOne } = vi.hoisted(() => {
   process.env.COGNITO_CLIENT_ID = 'test-client-id';
   process.env.COGNITO_REGION = 'us-west-2';
+  process.env.COGNITO_USER_POOL_ID = 'us-west-2_TestPool';
   return {
     mockCognitoSend: vi.fn(),
     mockQuery: vi.fn(),
@@ -32,6 +33,7 @@ vi.mock('@aws-sdk/client-cognito-identity-provider', () => ({
   ConfirmForgotPasswordCommand: vi.fn().mockImplementation((input: any) => ({ input })),
   AdminCreateUserCommand: vi.fn(),
   AdminSetUserPasswordCommand: vi.fn(),
+  AdminDeleteUserCommand: vi.fn().mockImplementation((input: any) => ({ input })),
   AuthFlowType: { USER_PASSWORD_AUTH: 'USER_PASSWORD_AUTH' },
 }));
 
@@ -89,11 +91,11 @@ describe('Auth lifecycle endpoints', () => {
       UserConfirmed: false,
       UserSub: 'sub-123',
     });
-    // Org bootstrap
+    // Org bootstrap — User and Subscription now use RETURNING "id"
     mockQuery
       .mockResolvedValueOnce([{ id: 'org-1' }])
-      .mockResolvedValueOnce([])
-      .mockResolvedValueOnce([]);
+      .mockResolvedValueOnce([{ id: 'user-1' }])
+      .mockResolvedValueOnce([{ id: 'sub-1' }]);
 
     const app = buildApp();
     const { status, body } = await post(app, '/internal/auth/register', {
@@ -112,11 +114,10 @@ describe('Auth lifecycle endpoints', () => {
 
   // ── 1b. Register fails if DB bootstrap fails ──────────────────────────────
 
-  it('register returns 500 if DB bootstrap fails (Cognito succeeds but DB insert fails)', async () => {
-    mockCognitoSend.mockResolvedValueOnce({
-      UserConfirmed: false,
-      UserSub: 'sub-456',
-    });
+  it('register returns 500 with BOOTSTRAP_FAILED if DB bootstrap fails', async () => {
+    mockCognitoSend
+      .mockResolvedValueOnce({ UserConfirmed: false, UserSub: 'sub-456' })
+      .mockResolvedValueOnce({});  // AdminDeleteUser cleanup
     // Org bootstrap fails (e.g., INSERT permission denied)
     mockQuery.mockRejectedValueOnce(new Error('permission denied for table Organization'));
 
@@ -129,9 +130,9 @@ describe('Auth lifecycle endpoints', () => {
       userType: 'OWNER',
     });
 
-    // Bootstrap failure must surface as a server error, not a silent 201
+    // Bootstrap failure must surface as a server error with BOOTSTRAP_FAILED code
     expect(status).toBe(500);
-    expect((body as any).error).toBeDefined();
+    expect(body.code).toBe('BOOTSTRAP_FAILED');
   });
 
   // ── 2. Confirm email success
