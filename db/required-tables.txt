@@ -11,6 +11,10 @@ public.User.cognitoSub
 public.Organization.id
 public.Subscription.id
 
+# Legal acceptance tracking (written during registration)
+public.LegalAcceptance.id
+public.LegalAcceptance.userId
+
 # Multi-org membership (multi-lease tenant support)
 public.user_organizations.user_id
 public.user_organizations.organization_id
