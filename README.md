@@ -13,15 +13,41 @@ Authentication and authorization service. Extends Cognito with app-specific auth
 
 Managed by Terraform in [leasebase-iac](https://github.com/motart/leasebase-iac).
 
+## Auth Flow
+
+1. Frontend sends `POST /api/auth/login` with email + password.
+2. BFF gateway proxies to `POST /internal/auth/login`, which authenticates via Cognito `USER_PASSWORD_AUTH`.
+3. On success, returns `{ accessToken, idToken, refreshToken, expiresIn }`.
+4. Frontend stores the **ID token** and sends it as `Authorization: Bearer <idToken>` on subsequent requests. The ID token is used because Cognito access tokens do not carry custom attributes (`custom:role`).
+5. Protected routes (e.g. `GET /internal/auth/me`) use `requireAuth` middleware from `@leasebase/service-common`, which verifies the JWT (signature, issuer, expiry, `aud` for ID tokens / `client_id` for access tokens).
+
+### Fail-Closed Auth (Post-Hardening)
+
+`requireAuth` in `@leasebase/service-common` is **fail-closed**: if the JWT does not contain a `custom:role` claim, the request is rejected with `401 Unauthorized`. There is no fallback to a default role or database lookup.
+
+**Note**: Using the ID token as Bearer is a temporary measure. A planned Pre-Token Generation Lambda will inject `custom:role` into access tokens, at which point the frontend will switch back to access tokens (standard OAuth pattern). See `docs/security/auth-authority-decision.md`.
+
+### Token Verification (Cognito-specific)
+
+Cognito access tokens do **not** contain an `aud` claim — they use `client_id` instead. The shared JWT verifier in `@leasebase/service-common` handles this:
+- Access tokens → validates `client_id` matches `COGNITO_CLIENT_ID`
+- ID tokens → validates `aud` matches `COGNITO_CLIENT_ID`
+
+## Environment Variables
+
+| Variable | Required | Description |
+|---|---|---|
+| `COGNITO_REGION` | Yes | AWS region (e.g. `us-west-2`) |
+| `COGNITO_USER_POOL_ID` | Yes | Cognito user pool ID |
+| `COGNITO_CLIENT_ID` | Yes | Cognito app client ID (canonical name) |
+
 ## Getting Started
 
 ```bash
 npm install
-npm run start:dev
-docker build -t leasebase-auth-service .
+npm run dev
 npm test
 ```
-
 
 ---
 
