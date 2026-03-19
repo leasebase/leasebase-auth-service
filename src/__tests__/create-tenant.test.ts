@@ -214,6 +214,33 @@ describe('POST /auth/create-tenant — Internal service-to-service', () => {
     expect(mockCognitoSend).not.toHaveBeenCalled();
   });
 
+  it('reuses existing user without password (multi-lease invite)', async () => {
+    // Existing-user payload: no password field at all (matches frontend existing-user flow)
+    const { password: _, ...payloadWithoutPassword } = validPayload;
+    // Mock existing user check (found)
+    mockQueryOne.mockResolvedValueOnce({ id: 'existing-user-id', cognitoSub: 'existing-cognito-sub' });
+    // Mock user_organizations INSERT
+    mockQuery.mockResolvedValueOnce([]);
+
+    const r = await req(port, 'POST', '/auth/create-tenant', payloadWithoutPassword, serviceKeyHeader);
+    expect(r.status).toBe(200);
+    expect(r.body.existingUser).toBe(true);
+    expect(r.body.userId).toBe('existing-user-id');
+    expect(mockCognitoSend).not.toHaveBeenCalled();
+  });
+
+  it('rejects new user without password', async () => {
+    const { password: _, ...payloadWithoutPassword } = validPayload;
+    // Mock existing user check (none found — new user path)
+    mockQueryOne.mockResolvedValueOnce(null);
+
+    const r = await req(port, 'POST', '/auth/create-tenant', payloadWithoutPassword, serviceKeyHeader);
+    expect(r.status).toBe(400);
+    expect(r.body.error.message).toContain('Password is required');
+    // Cognito should NOT have been called
+    expect(mockCognitoSend).not.toHaveBeenCalled();
+  });
+
   it('returns 400 for existing username', async () => {
     // Mock existing user check (none found — new user path)
     mockQueryOne.mockResolvedValueOnce(null);

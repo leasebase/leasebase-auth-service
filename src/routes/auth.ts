@@ -688,7 +688,8 @@ router.get('/config', (_req: Request, res: Response) => {
 // Protected by X-Internal-Service-Key header.
 const createTenantSchema = z.object({
   email: z.string().email(),
-  password: z.string().min(8),
+  // Password is optional: existing users (multi-lease) already have credentials.
+  password: z.string().min(8).optional(),
   firstName: z.string().min(1),
   lastName: z.string().min(1),
   organizationId: z.string().uuid(),
@@ -758,6 +759,11 @@ router.post('/create-tenant', validateBody(createTenantSchema), async (req: Requ
     }
 
     // ── New user: create Cognito identity + User row ─────────────────────
+
+    // Password is required for new users — existing users skip this path above.
+    if (!password) {
+      throw new ValidationError('Password is required for new tenant accounts');
+    }
 
     // 1. Create Cognito user (admin-initiated, suppress welcome email)
     const createCommand = new AdminCreateUserCommand({
