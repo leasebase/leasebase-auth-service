@@ -1,6 +1,7 @@
 import { createApp, startApp } from '@leasebase/service-common';
 import { authRouter } from './routes/auth';
 import { profileRouter } from './routes/profile';
+import { settingsRouter } from './routes/settings';
 
 const app = createApp();
 
@@ -14,5 +15,9 @@ app.use('/internal/auth', authRouter);
 //   GET|PUT  /api/profile       → base user profile (all personas)
 //   GET|PUT  /api/profile/owner → owner branding / billing
 app.use('/internal/profile', profileRouter);
+
+// Settings routes — proxied via BFF:
+//   GET|PUT  /api/settings → user settings (theme, branding, dashboard defaults)
+app.use('/internal/settings', settingsRouter);
 
 startApp(app);
