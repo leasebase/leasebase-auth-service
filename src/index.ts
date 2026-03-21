@@ -1,5 +1,6 @@
 import { createApp, startApp } from '@leasebase/service-common';
 import { authRouter } from './routes/auth';
+import { profileRouter } from './routes/profile';
 
 const app = createApp();
 
@@ -8,5 +9,10 @@ const app = createApp();
 app.set('trust proxy', true);
 
 app.use('/internal/auth', authRouter);
+
+// Profile routes — proxied via BFF:
+//   GET|PUT  /api/profile       → base user profile (all personas)
+//   GET|PUT  /api/profile/owner → owner branding / billing
+app.use('/internal/profile', profileRouter);
 
 startApp(app);
