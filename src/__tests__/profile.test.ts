@@ -112,9 +112,31 @@ describe('PUT /profile/owner', () => {
     expect(sql).toContain('ON CONFLICT');
   });
 
-  it('rejects invalid theme_mode', async () => {
-    const { status } = await req(port, 'PUT', '/p/owner', { theme_mode: 'invalid' });
-    expect(status).toBeGreaterThanOrEqual(400);
-    expect(mockQueryOne).not.toHaveBeenCalled();
+  it('does not write theme_mode (canonical source is user_settings)', async () => {
+    mockQueryOne.mockResolvedValueOnce({ user_id: 'user-123', company_name: 'X' });
+    await req(port, 'PUT', '/p/owner', { company_name: 'X' });
+    const sql = mockQueryOne.mock.calls[0][0] as string;
+    expect(sql).not.toContain('theme_mode');
+    expect(sql).not.toContain('primary_color');
+  });
+});
+
+// ── Null-clearing behavior (Phase 3) ─────────────────────────────────────────
+
+describe('PUT /profile null-clearing', () => {
+  it('only updates fields present in body (omitted = no change)', async () => {
+    mockQueryOne.mockResolvedValueOnce({ user_id: 'user-123', first_name: 'Bob' });
+    await req(port, 'PUT', '/p', { first_name: 'Bob' });
+    const sql = mockQueryOne.mock.calls[0][0] as string;
+    expect(sql).toContain('first_name');
+    expect(sql).not.toContain('timezone');
+  });
+
+  it('sends null for explicitly null fields (clearing)', async () => {
+    mockQueryOne.mockResolvedValueOnce({ user_id: 'user-123', avatar_url: null });
+    await req(port, 'PUT', '/p', { avatar_url: null });
+    const params = mockQueryOne.mock.calls[0][1] as unknown[];
+    // params[0] = userId, params[1] = avatar_url value
+    expect(params[1]).toBeNull();
   });
 });

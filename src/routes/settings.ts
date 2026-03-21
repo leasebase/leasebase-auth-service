@@ -57,30 +57,54 @@ router.get('/', requireAuth, async (req: Request, res: Response, next: NextFunct
 });
 
 // PUT / — Upsert the authenticated user's settings
+// Null-clearing contract: omitted = no change, null = clear, value = set.
 router.put('/', requireAuth, validateBody(updateSettingsSchema),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const user = (req as AuthenticatedRequest).user;
       const body = req.body as z.infer<typeof updateSettingsSchema>;
 
-      const row = await queryOne(
-        `INSERT INTO user_settings (user_id, theme_mode, primary_color, secondary_color, default_dashboard, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
-         ON CONFLICT (user_id) DO UPDATE SET
-           theme_mode = COALESCE($2, user_settings.theme_mode),
-           primary_color = COALESCE($3, user_settings.primary_color),
-           secondary_color = COALESCE($4, user_settings.secondary_color),
-           default_dashboard = COALESCE($5, user_settings.default_dashboard),
-           updated_at = NOW()
-         RETURNING *`,
-        [
-          user.userId,
-          body.theme_mode ?? null,
-          body.primary_color ?? null,
-          body.secondary_color ?? null,
-          body.default_dashboard ?? null,
-        ],
-      );
+      const setClauses: string[] = [];
+      const params: unknown[] = [user.userId];
+      let idx = 2;
+
+      const fields: Array<[string, unknown]> = [
+        ['theme_mode', body.theme_mode],
+        ['primary_color', body.primary_color],
+        ['secondary_color', body.secondary_color],
+        ['default_dashboard', body.default_dashboard],
+      ];
+
+      for (const [col, val] of fields) {
+        if (col in body) {
+          setClauses.push(`${col} = $${idx}`);
+          params.push(val ?? null);
+          idx++;
+        }
+      }
+
+      let row;
+      if (setClauses.length === 0) {
+        row = await queryOne(
+          `INSERT INTO user_settings (user_id, created_at, updated_at)
+           VALUES ($1, NOW(), NOW())
+           ON CONFLICT (user_id) DO NOTHING
+           RETURNING *`,
+          [user.userId],
+        );
+        if (!row) {
+          row = await queryOne(`SELECT * FROM user_settings WHERE user_id = $1`, [user.userId]);
+        }
+      } else {
+        setClauses.push('updated_at = NOW()');
+        row = await queryOne(
+          `INSERT INTO user_settings (user_id, created_at, updated_at)
+           VALUES ($1, NOW(), NOW())
+           ON CONFLICT (user_id) DO UPDATE SET ${setClauses.join(', ')}
+           RETURNING *`,
+          params,
+        );
+      }
 
       logger.info({ userId: user.userId }, 'User settings upserted');
       res.json({ data: row });
