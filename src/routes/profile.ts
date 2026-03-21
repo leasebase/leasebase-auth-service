@@ -91,7 +91,14 @@ router.put('/', requireAuth, validateBody(updateProfileSchema),
 );
 
 // ══════════════════════════════════════════════════════════════════════════════
-// OWNER PROFILE — branding, billing, company info
+// OWNER PROFILE — company identity, billing info
+//
+// TRANSITIONAL FIELDS (Phase 2):
+//   primary_color, secondary_color, theme_mode — canonical source is now
+//   public.user_settings (GET|PUT /api/settings). These columns remain
+//   readable/writable here for Phase 1 backward compatibility.
+//   Frontend Settings page reads from /api/settings.
+//   To be removed from owner_profiles once all consumers migrate.
 // ══════════════════════════════════════════════════════════════════════════════
 
 // GET /owner — Fetch the authenticated owner's extended profile
